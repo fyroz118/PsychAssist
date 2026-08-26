@@ -1,15 +1,8 @@
 """
-
-### 3. File name: `PsychAssist_streamlit.py`
-
-This is the main (long) file. Copy **everything** below:
-
-```python
-"""
 PsychAssist Web v2 - Clinical Decision Support (Streamlit)
 Mobile-friendly | Works on Android browsers
 Features: Assessment, PHQ-9, GAD-7, Treatment Tracker, Chatbot, History
-This is a decision-support tool only — not a diagnosis.
+This is a decision-support tool only - not a diagnosis.
 """
 
 import streamlit as st
