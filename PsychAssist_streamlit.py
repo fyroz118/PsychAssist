@@ -134,7 +134,7 @@ medication_database = {
             {"name": "Escitalopram", "class": "SSRI", "starting_dose": "10mg", "max_dose": "20mg", "side_effects": "Nausea, fatigue, insomnia, sexual dysfunction", "contraindications": "MAOIs, pimozide"},
             {"name": "Fluoxetine", "class": "SSRI", "starting_dose": "20mg", "max_dose": "80mg", "side_effects": "Nervousness, anxiety, insomnia, weight changes", "contraindications": "MAOIs, thioridazine"}
         ],
-        "second_line": [{"name": "Bupropion", "class": "NDRI", "starting_dose": "150mg", "max_dose": "300mg", "side_effects": "Agitation, dry mouth, insomnia", "contraindications": "Seizure disorder, eating disorders"}],
+        "second_line": [{"name": "Bupropion", "class": "NDRI", "starting_dose": "150mg", "max_dose": "300mg", "side_effects": "Agigation, dry mouth, insomnia", "contraindications": "Seizure disorder, eating disorders"}],
         "augmentation": [{"name": "Aripiprazole", "class": "Atypical Antipsychotic", "starting_dose": "2-5mg", "max_dose": "15mg", "side_effects": "Akathisia, weight gain", "contraindications": "Hypersensitivity"}]
     },
     "Bipolar I Disorder - Manic Episode": {
