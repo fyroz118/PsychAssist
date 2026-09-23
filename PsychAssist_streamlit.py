@@ -1,16 +1,24 @@
 # -*- coding: utf-8 -*-
-# PsychAssist Web v4.2 - Clinical Decision Support (Streamlit)
+# PsychAssist Web v4.3 - Clinical Decision Support (Streamlit)
 #
 # Decision support only - not a diagnosis.
 #
-# v4.2 fixes
-#   * Removed invalid st.canvas() usage; using streamlit-drawable-canvas.
-#   * Handwritten notes saved as base64 PNG data URLs.
-#   * Fixed swapped column indices when listing saved counselling notes.
+# v4.3
+#   * Enhanced handwriting canvas:
+#       - multi-colour pen (8 presets + custom colour picker)
+#       - eraser tool with adjustable size
+#       - full-screen drawing mode
+#       - true clear-canvas (widget key bump)
+#       - empty-canvas detection before saving
+#
+# v4.2
+#   * Replaced invalid st.canvas() with streamlit-drawable-canvas.
+#   * Handwriting saved as base64 PNG data URLs.
+#   * Fixed column indices when listing saved counselling notes.
 #   * Fixed undefined conn in Assessment / ADHD pages.
 #   * Fixed ADHD INSERT column names.
-#   * Fixed placeholder count in Assessment INSERT (31 cols).
-#   * Removed problematic non-ASCII box characters from report text.
+#   * Fixed placeholder count in Assessment INSERT.
+#   * Removed non-ASCII box characters from report text.
 
 import io
 import base64
@@ -18,6 +26,7 @@ import random
 import sqlite3
 from datetime import datetime, date
 
+import numpy as np
 import pandas as pd
 import streamlit as st
 from PIL import Image
@@ -241,6 +250,288 @@ medication_database = {
 }
 
 PHQ9_QUESTIONS = [
+    "Little interest or pleasure in doing things",
+    "Feeling down, depressed, or hopeless",
+    "Trouble falling or staying asleep, or sleeping too much",
+    "Feeling tired or having little energy",
+    "Poor appetite or overeating",
+    "Feeling bad about yourself - or that you are a failure",
+    "Trouble concentrating on things",
+    "Moving or speaking slowly / being fidgety or restless",
+    "Thoughts that you would be better off dead or of hurting yourself",
+]
+
+GAD7_QUESTIONS = [
+    "Feeling nervous, anxious, or on edge",
+    "Not being able to stop or control worrying",
+    "Worrying too much about different things",
+    "Trouble relaxing",
+    "Being so restless that it is hard to sit still",
+    "Becoming easily annoyed or irritable",
+    "Feeling afraid as if something awful might happen",
+]
+
+OPTIONS = ["Not at all (0)", "Several days (1)",
+           "More than half the days (2)", "Nearly every day (3)"]
+
+CHATBOT = {
+    "depression": [
+        "Major depression typically requires 4-6 weeks of antidepressant treatment for full response.",
+        "SSRIs are common first-line options.",
+        "CBT is highly effective for depression.",
+        "Monitor suicidal ideation early in treatment.",
+    ],
+    "mania": [
+        "Lithium therapeutic range usually 0.6-1.2 mEq/L.",
+        "Valproate needs liver monitoring.",
+        "Sleep deprivation can trigger mania.",
+        "Avoid antidepressants in acute mania.",
+    ],
+    "psychosis": [
+        "Early intervention improves outcomes.",
+        "Clozapine for treatment-resistant schizophrenia.",
+        "Metabolic monitoring with atypicals is essential.",
+    ],
+    "delirium": [
+        "Delirium is often reversible if cause is treated.",
+        "Common causes: infection, meds, metabolic issues.",
+        "Non-drug measures first.",
+    ],
+    "risk": [
+        "Repeat suicide risk assessment each visit.",
+        "Safety plans: triggers, coping, contacts.",
+        "Remove access to lethal means when high risk.",
+    ],
+    "medication": [
+        "Start low, go slow.",
+        "Full response may take 4-8 weeks.",
+        "Check drug interactions.",
+    ],
+    "phq9": [
+        "PHQ-9: 5-9 Mild, 10-14 Moderate, 15-19 Moderately severe, 20+ Severe.",
+        "Score >=10 usually needs treatment.",
+    ],
+    "gad7": [
+        "GAD-7: 5-9 Mild, 10-14 Moderate, 15+ Severe.",
+        "Score >=10 suggests clinically significant anxiety.",
+    ],
+}
+
+GENERAL = [
+    "This is decision support only. Verify with guidelines.",
+    "Document clinical reasoning.",
+    "Regular follow-up is essential.",
+]
+
+
+def chatbot_reply(q):
+    q = q.lower()
+    km = {
+        "depression": "depression", "depressive": "depression", "mdd": "depression",
+        "phq": "phq9", "mania": "mania", "bipolar": "mania",
+        "psychosis": "psychosis", "schizophrenia": "psychosis",
+        "delirium": "delirium", "risk": "risk", "suicide": "risk",
+        "medication": "medication", "drug": "medication",
+        "gad": "gad7", "anxiety": "gad7",
+    }
+    for k, cat in km.items():
+        if k in q:
+            return random.choice(CHATBOT.get(cat, GENERAL))
+    return random.choice(GENERAL)
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+def canvas_to_b64_png(image_data):
+    """Convert st_canvas numpy RGBA array to a base64 PNG data URL."""
+    if image_data is None:
+        return ""
+    arr = image_data
+    if arr.dtype != "uint8":
+        arr = arr.astype("uint8")
+    img = Image.fromarray(arr, "RGBA")
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+
+
+def has_s(selected, s):
+    return s in selected
+
+
+def severity_grader(score):
+    if score <= 5:
+        return "Mild"
+    if score <= 12:
+        return "Moderate"
+    if score <= 20:
+        return "Severe"
+    return "Very Severe"
+
+
+def normalize_scores(d):
+    t = sum(d.values())
+    if t == 0:
+        return d
+    return {k: round((v / t) * 100, 2) for k, v in d.items()}
+
+
+def depressive_logic(selected, duration, affect):
+    if not (has_s(selected, "Low mood") or has_s(selected, "Anhedonia")):
+        return 0
+    score = 12
+    for s in ["Fatigue", "Hopelessness", "Excessive guilt",
+              "Suicidal thoughts", "Sleep disturbance", "Poor concentration"]:
+        if has_s(selected, s):
+            score += 2
+    if sum(1 for s in ["Grandiosity", "Increased energy", "Reduced sleep"]
+           if has_s(selected, s)) >= 2:
+        score -= 8
+    if duration in ["Weeks", "Months"]:
+        score += 2
+    if affect == "Depressed":
+        score += 3
+    return max(score, 0)
+
+
+def mania_logic(selected, duration, speech, thought):
+    if not (has_s(selected, "Reduced sleep") and has_s(selected, "Increased energy")):
+        return 0
+    score = 12
+    for s in ["Grandiosity", "Pressured speech", "Racing thoughts",
+              "Risk-taking behavior", "Distractibility"]:
+        if has_s(selected, s):
+            score += 2
+    if duration in ["Days", "Weeks"]:
+        score += 2
+    if speech == "Pressured":
+        score += 3
+    if thought == "Flight of ideas":
+        score += 3
+    return max(score, 0)
+
+
+def psychosis_logic(selected, duration, speech, thought):
+    if not (has_s(selected, "Auditory hallucinations")
+            or has_s(selected, "Visual hallucinations")
+            or has_s(selected, "Delusions")):
+        return 0
+    score = 12
+    for s in ["Paranoia", "Disorganized speech", "Negative symptoms"]:
+        if has_s(selected, s):
+            score += 2
+    if duration in ["Months", "Years"]:
+        score += 3
+    if speech == "Disorganized":
+        score += 3
+    if thought == "Disorganized":
+        score += 4
+    return max(score, 0)
+
+
+def delirium_logic(selected, duration, onset, fluctuating):
+    if not (has_s(selected, "Confusion") and has_s(selected, "Disorientation")):
+        return 0
+    score = 15
+    if has_s(selected, "Fluctuating attention") or has_s(selected, "Visual hallucinations"):
+        score += 3
+    if duration in ["Hours", "Days"]:
+        score += 5
+    if onset == "Sudden":
+        score += 4
+    if fluctuating:
+        score += 4
+    return max(score, 0)
+
+
+def diagnose_mdd(selected, duration, impairment):
+    cnt = sum(1 for s in ["Low mood", "Anhedonia", "Fatigue", "Hopelessness",
+                          "Excessive guilt", "Suicidal thoughts",
+                          "Sleep disturbance", "Poor concentration"]
+              if has_s(selected, s))
+    core = has_s(selected, "Low mood") or has_s(selected, "Anhedonia")
+    no_mania = not (has_s(selected, "Grandiosity") or has_s(selected, "Increased energy"))
+    if (cnt >= 5 and core and no_mania
+            and duration in ["Weeks", "Months"]
+            and impairment != "None reported"):
+        return {"diagnosis": "Major Depressive Disorder",
+                "status": "CRITERIA FULLY MET", "confidence": "HIGH"}
+    if cnt >= 3:
+        return {"diagnosis": "Major Depressive Disorder",
+                "status": "PARTIAL CRITERIA", "confidence": "MODERATE"}
+    return None
+
+
+def diagnose_mania(selected, duration):
+    cnt = sum(1 for s in ["Reduced sleep", "Increased energy", "Grandiosity",
+                          "Pressured speech", "Racing thoughts",
+                          "Risk-taking behavior", "Distractibility"]
+              if has_s(selected, s))
+    if (cnt >= 4
+            and has_s(selected, "Reduced sleep")
+            and has_s(selected, "Increased energy")
+            and duration in ["Days", "Weeks"]):
+        return {"diagnosis": "Bipolar I Disorder - Manic Episode",
+                "status": "CRITERIA FULLY MET", "confidence": "HIGH"}
+    return None
+
+
+def diagnose_schizophrenia(selected, duration):
+    core = has_s(selected, "Delusions") or has_s(selected, "Auditory hallucinations")
+    cnt = sum(1 for s in ["Auditory hallucinations", "Visual hallucinations",
+                          "Delusions", "Paranoia", "Disorganized speech",
+                          "Negative symptoms"] if has_s(selected, s))
+    if core and cnt >= 2 and duration in ["Months", "Years"]:
+        return {"diagnosis": "Schizophrenia Spectrum Disorder",
+                "status": "CRITERIA FULLY MET", "confidence": "HIGH"}
+    return None
+
+
+def diagnose_delirium(selected, duration, fluctuating):
+    if (has_s(selected, "Confusion")
+            and has_s(selected, "Disorientation")
+            and (has_s(selected, "Fluctuating attention") or fluctuating)
+            and duration in ["Hours", "Days"]):
+        return {"diagnosis": "Delirium", "status": "CRITERIA FULLY MET",
+                "confidence": "HIGH"}
+    return None
+
+
+def organic_psychosis_detector(selected, onset, fluctuating, seizure, focal, head_injury):
+    score = 0
+    if has_s(selected, "Visual hallucinations"):
+        score += 3
+    if has_s(selected, "Confusion"):
+        score += 4
+    if fluctuating:
+        score += 4
+    if seizure:
+        score += 4
+    if focal:
+        score += 5
+    if onset == "Sudden":
+        score += 3
+    if head_injury:
+        score += 4
+    if score >= 15:
+        level = "VERY HIGH suspicion of organic psychosis"
+    elif score >= 10:
+        level = "HIGH suspicion of organic psychosis"
+    elif score >= 6:
+        level = "MODERATE suspicion of organic psychosis"
+    else:
+        level = "LOW suspicion of organic psychosis"
+    return level, score
+
+
+def risk_assessment(selected, suicide_plan, command_hall, violent, access_means):
+    score = 0
+    if has_s(selected, "Suicidal thoughts"):
+        score += 3
+    if suicide_plan:
+        score += 6
+    if command_halONS = [
     "Little interest or pleasure in doing things",
     "Feeling down, depressed, or hopeless",
     "Trouble falling or staying asleep, or sleeping too much",
