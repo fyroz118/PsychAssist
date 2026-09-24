@@ -1,0 +1,8 @@
+version: "3.9"
+services:
+  psychassist:
+    build: .
+    ports: ["8501:8501"]
+    volumes:
+      - ./data:/app/data
+      - ./psychassist_web.db:/app/psychassist_web.db
