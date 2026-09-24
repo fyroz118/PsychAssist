@@ -1,36 +1,58 @@
 # -*- coding: utf-8 -*-
-# PsychAssist Web v4.4 - Clinical Decision Support (Streamlit)
-#
+# PsychAssist Web v5.0 - Clinical Decision Support (Streamlit)
 # Decision support only - not a diagnosis.
 #
-# v4.4
-#   * Fixed StreamlitWidgetAlreadyInstantiatedError on the full-screen
-#     toggle button: state change moved into an on_click callback.
-#
-# v4.3
-#   * Enhanced handwriting canvas: multi-colour pen, eraser,
-#     full-screen mode, clear, empty-canvas detection.
-#
-# v4.2
-#   * Replaced invalid st.canvas() with streamlit-drawable-canvas.
-#   * Handwriting saved as base64 PNG data URLs.
-#   * Fixed column indices when listing saved counselling notes.
-#   * Fixed undefined conn in Assessment / ADHD pages.
-#   * Fixed ADHD INSERT column names.
-#   * Fixed placeholder count in Assessment INSERT.
-#   * Removed non-ASCII box characters from report text.
+# Bundles v4.x fixes plus:
+#   1 Treatment tracker, 2 Multi-step undo, 3 PDF report, 4 More scales,
+#   5 ICD-11 lookup, 6 Drug interaction checker, 7 Risk timeline,
+#   8 Scale trend charts, 9 Sidebar badges, 10 Global patient selector,
+#   11 True browser fullscreen, 12 SVG download, 13 Re-edit handwriting,
+#   14 Dark mode, 15 Keyboard shortcuts, 16 Voice dictation,
+#   18 Backup/Restore, 19 Audit log, 20 Soft delete, 21 Search/filter,
+#   22 Pagination, 23 Auth gate (optional), 24 Per-user data,
+#   25 Encryption (optional), 26 Row-level access (optional),
+#   27 Session timeout, 28 Epidemiology filters, 29 Outcomes dashboard,
+#   30 Excel export, 31 Print CSS.
+# 17/33/35 are configured in separate files.
 
 import io
+import os
 import base64
+import hashlib
 import random
 import sqlite3
-from datetime import datetime, date
+import time
+from datetime import datetime, date, timedelta
 
 import numpy as np
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 from PIL import Image
 from streamlit_drawable_canvas import st_canvas
+
+# --------------------------- optional imports ------------------------------
+try:
+    from fpdf import FPDF
+    HAS_FPDF = True
+except Exception:
+    HAS_FPDF = False
+
+try:
+    from cryptography.fernet import Fernet
+    HAS_FERNET = True
+except Exception:
+    HAS_FERNET = False
+
+try:
+    import openpyxl  # noqa: F401
+    HAS_OPENPYXL = True
+except Exception:
+    HAS_OPENPYXL = False
+
+# --------------------------- config ----------------------------------------
+DB_PATH = "psychassist_web.db"
+SESSION_TIMEOUT_MIN = 30   # 27
 
 st.set_page_config(
     page_title="PsychAssist Web",
@@ -39,21 +61,160 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-DB_PATH = "psychassist_web.db"
+
+def _secret(*path, default=None):
+    try:
+        cur = st.secrets
+        for p in path:
+            cur = cur[p]
+        return cur
+    except Exception:
+        return default
 
 
-# ---------------------------------------------------------------------------
-# Database
-# ---------------------------------------------------------------------------
+APP_PASSWORD = _secret("auth", "password", default=None)             # 23
+USER_NAMES = _secret("auth", "users", default=None)                 # 24
+DB_URL = _secret("database", "url", default=None)                   # 17
+FERNET_KEY = _secret("encryption", "key", default=None)             # 25
+MULTIUSER = bool(USER_NAMES)                                        # 26
+USE_AUTH = bool(APP_PASSWORD or USER_NAMES)
+USE_PG = bool(DB_URL)
+USE_ENCRYPTION = bool(FERNET_KEY and HAS_FERNET)
+
+
+def _fernet():
+    if not USE_ENCRYPTION:
+        return None
+    if "fernet" not in st.session_state:
+        st.session_state.fernet = Fernet(
+            FERNET_KEY.encode() if isinstance(FERNET_KEY, str) else FERNET_KEY
+        )
+    return st.session_state.fernet
+
+
+def enc(text):                                                      # 25
+    if not text or not USE_ENCRYPTION:
+        return text or ""
+    return "enc::" + _fernet().encrypt(text.encode()).decode()
+
+
+def dec(text):
+    if not text or not isinstance(text, str):
+        return text or ""
+    if not text.startswith("enc::"):
+        return text
+    if not USE_ENCRYPTION:
+        return text
+    try:
+        return _fernet().decrypt(text[5:].encode()).decode()
+    except Exception:
+        return text
+
+
+# --------------------------- auth gate (23) --------------------------------
+def check_auth():
+    if not USE_AUTH:
+        st.session_state.user = "guest"
+        return True
+    if st.session_state.get("authed"):
+        return True
+
+    st.title("PsychAssist - Sign in")
+    st.caption("Decision support only. Not a diagnosis.")
+    with st.form("login"):
+        user = st.text_input("Username")
+        pw = st.text_input("Password", type="password")
+        ok = st.form_submit_button("Sign in")
+
+    if ok:
+        if USER_NAMES and user in USER_NAMES:
+            expected = USER_NAMES[user]
+            if pw == expected:
+                st.session_state.authed = True
+                st.session_state.user = user
+                st.session_state.last_seen = time.time()
+                st.rerun()
+            else:
+                st.error("Wrong password.")
+        elif APP_PASSWORD and pw == APP_PASSWORD:
+            st.session_state.authed = True
+            st.session_state.user = user or "clinician"
+            st.session_state.last_seen = time.time()
+            st.rerun()
+        else:
+            st.error("Invalid credentials.")
+    return False
+
+
+def enforce_timeout():                                              # 27
+    now = time.time()
+    last = st.session_state.get("last_seen", now)
+    if now - last > SESSION_TIMEOUT_MIN * 60:
+        st.session_state.authed = False
+        st.warning("Session timed out. Please sign in again.")
+        st.stop()
+    st.session_state.last_seen = now
+
+
+# --------------------------- database --------------------------------------
+def _adapt(sql):
+    return sql.replace("?", "%s") if USE_PG else sql
+
+
 def get_conn():
+    if USE_PG:
+        try:
+            import psycopg2
+            return psycopg2.connect(DB_URL)
+        except Exception:
+            pass
     return sqlite3.connect(DB_PATH, check_same_thread=False)
 
 
-def init_db():
-    conn = get_conn()
-    c = conn.cursor()
+class DBCursor:
+    def __init__(self, cur, pg):
+        self._c = cur
+        self._pg = pg
 
-    c.execute(
+    def execute(self, sql, params=()):
+        self._c.execute(_adapt(sql) if self._pg else sql, params)
+        return self
+
+    def fetchall(self):
+        return self._c.fetchall()
+
+    def fetchone(self):
+        return self._c.fetchone()
+
+
+class DBConn:
+    def __init__(self, raw, pg):
+        self._raw = raw
+        self._pg = pg
+
+    def cursor(self):
+        return DBCursor(self._raw.cursor(), self._pg)
+
+    def execute(self, sql, params=()):
+        cur = self._raw.cursor()
+        cur.execute(_adapt(sql) if self._pg else sql, params)
+        return DBCursor(cur, self._pg)
+
+    def commit(self):
+        self._raw.commit()
+
+    def close(self):
+        self._raw.close()
+
+
+def db():
+    return DBConn(get_conn(), USE_PG)
+
+
+def init_db():
+    c = db()
+    cur = c.cursor()
+    cur.execute(
         "CREATE TABLE IF NOT EXISTS assessments ("
         "id INTEGER PRIMARY KEY AUTOINCREMENT,"
         "patient_name TEXT, age TEXT, sex TEXT, symptoms TEXT, syndrome TEXT,"
@@ -61,75 +222,95 @@ def init_db():
         "organic_level TEXT, organic_score INTEGER, functional_impairment TEXT,"
         "mse TEXT, duration TEXT, onset TEXT, pattern TEXT,"
         "speech TEXT, affect TEXT, thought_process TEXT, insight TEXT, judgment TEXT,"
-        "substance_use TEXT, neuro_findings TEXT,"
-        "report_text TEXT, ai_insights TEXT,"
-        "mdd_criteria TEXT, mania_criteria TEXT, schizophrenia_criteria TEXT, delirium_criteria TEXT,"
-        "mixed_features INTEGER, symptom_weight REAL,"
+        "substance_use TEXT, neuro_findings TEXT, report_text TEXT, ai_insights TEXT,"
+        "mdd_criteria TEXT, mania_criteria TEXT, schizophrenia_criteria TEXT, "
+        "delirium_criteria TEXT, mixed_features INTEGER, symptom_weight REAL,"
         "phq9_score INTEGER, gad7_score INTEGER, adhd_score INTEGER, adhd_type TEXT,"
         "adhd_severity TEXT, differential TEXT, treatment_recommendations TEXT,"
-        "timestamp TEXT)"
+        "created_by TEXT, deleted_at TEXT, timestamp TEXT)"
     )
-
-    c.execute(
+    cur.execute(
         "CREATE TABLE IF NOT EXISTS treatments ("
         "id INTEGER PRIMARY KEY AUTOINCREMENT,"
         "patient_name TEXT, medication_name TEXT, medication_class TEXT,"
         "dose TEXT, frequency TEXT, route TEXT, start_date TEXT, end_date TEXT,"
         "status TEXT, adherence TEXT, side_effects TEXT, psychotherapy TEXT,"
-        "reason_start TEXT, reason_stop TEXT, notes TEXT, timestamp TEXT)"
+        "reason_start TEXT, reason_stop TEXT, notes TEXT, created_by TEXT,"
+        "deleted_at TEXT, timestamp TEXT)"
     )
-
-    c.execute(
+    cur.execute(
         "CREATE TABLE IF NOT EXISTS phq9_scores ("
         "id INTEGER PRIMARY KEY AUTOINCREMENT,"
-        "patient_name TEXT, total_score INTEGER, severity TEXT, answers TEXT, timestamp TEXT)"
+        "patient_name TEXT, total_score INTEGER, severity TEXT, answers TEXT,"
+        "created_by TEXT, deleted_at TEXT, timestamp TEXT)"
     )
-
-    c.execute(
+    cur.execute(
         "CREATE TABLE IF NOT EXISTS gad7_scores ("
         "id INTEGER PRIMARY KEY AUTOINCREMENT,"
-        "patient_name TEXT, total_score INTEGER, severity TEXT, answers TEXT, timestamp TEXT)"
+        "patient_name TEXT, total_score INTEGER, severity TEXT, answers TEXT,"
+        "created_by TEXT, deleted_at TEXT, timestamp TEXT)"
     )
-
-    c.execute(
+    cur.execute(
         "CREATE TABLE IF NOT EXISTS adhd_scores ("
         "id INTEGER PRIMARY KEY AUTOINCREMENT,"
-        "patient_name TEXT, total_score INTEGER, severity TEXT, answers TEXT, adhd_type TEXT, timestamp TEXT)"
+        "patient_name TEXT, total_score INTEGER, severity TEXT, answers TEXT,"
+        "adhd_type TEXT, created_by TEXT, deleted_at TEXT, timestamp TEXT)"
     )
-
-    c.execute(
+    cur.execute(
         "CREATE TABLE IF NOT EXISTS counselling_notes ("
         "id INTEGER PRIMARY KEY AUTOINCREMENT,"
         "patient_name TEXT, age TEXT, sex TEXT, date TEXT,"
         "counselling_symptoms TEXT, important_notes TEXT, handwritten_notes TEXT,"
-        "timestamp TEXT)"
+        "handwriting_svg TEXT, created_by TEXT, deleted_at TEXT, timestamp TEXT)"
     )
-
-    c.execute(
+    cur.execute(
         "CREATE TABLE IF NOT EXISTS follow_ups ("
         "id INTEGER PRIMARY KEY AUTOINCREMENT,"
         "patient_name TEXT, assessment_id INTEGER, follow_up_date TEXT,"
         "status TEXT, notes TEXT, symptoms_improved TEXT, adherence TEXT,"
-        "side_effects TEXT, global_impression TEXT, created_at TEXT, completed_at TEXT)"
+        "side_effects TEXT, global_impression TEXT, created_by TEXT,"
+        "deleted_at TEXT, created_at TEXT, completed_at TEXT)"
     )
-
-    c.execute(
+    cur.execute(
         "CREATE TABLE IF NOT EXISTS patients ("
         "id INTEGER PRIMARY KEY AUTOINCREMENT,"
         "name TEXT UNIQUE, age TEXT, sex TEXT, phone TEXT, notes TEXT,"
-        "first_seen TEXT, last_seen TEXT, created_at TEXT)"
+        "created_by TEXT, deleted_at TEXT, first_seen TEXT, last_seen TEXT, created_at TEXT)"
     )
+    cur.execute(
+        "CREATE TABLE IF NOT EXISTS audit_log ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "ts TEXT, user TEXT, action TEXT, table_name TEXT, row_id INTEGER, detail TEXT)"
+    )
+    cur.execute(
+        "CREATE TABLE IF NOT EXISTS other_scales ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "patient_name TEXT, scale TEXT, score INTEGER, severity TEXT,"
+        "answers TEXT, created_by TEXT, deleted_at TEXT, timestamp TEXT)"
+    )
+    c.commit()
+    c.close()
 
-    conn.commit()
-    conn.close()
+
+def audit(action, table_name, row_id=None, detail=""):              # 19
+    try:
+        c = db()
+        c.execute(
+            "INSERT INTO audit_log (ts, user, action, table_name, row_id, detail) "
+            "VALUES (?,?,?,?,?,?)",
+            (str(datetime.now()), st.session_state.get("user", "?"),
+             action, table_name, row_id, detail[:500])
+        )
+        c.commit()
+        c.close()
+    except Exception:
+        pass
 
 
 init_db()
 
 
-# ---------------------------------------------------------------------------
-# Static data
-# ---------------------------------------------------------------------------
+# --------------------------- static data -----------------------------------
 symptom_categories = {
     "Mood Symptoms": ["Low mood", "Anhedonia", "Fatigue", "Hopelessness",
                       "Excessive guilt", "Suicidal thoughts",
@@ -155,22 +336,102 @@ symptom_categories = {
                             "Social withdrawal"],
 }
 
-icd11_codes = {
-    "Major Depressive Disorder": "6A70",
-    "Bipolar I Disorder - Manic Episode": "6A60",
-    "Schizophrenia Spectrum Disorder": "6A20",
-    "Delirium": "6D70",
-    "Generalized Anxiety Disorder": "6B00",
+# 5 - expanded ICD-11 / DSM-5 lookup
+ICD_LOOKUP = {
+    "Major Depressive Disorder": {
+        "icd11": "6A70", "dsm5": "296.2x / 296.3x",
+        "criteria": "5+ symptoms for 2 weeks including low mood or anhedonia; "
+                    "functional impairment; not due to substance/medical cause.",
+        "differential": "Bipolar depression, persistent depressive disorder, "
+                        "adjustment disorder, hypothyroidism, anemia.",
+    },
+    "Bipolar I Disorder - Manic Episode": {
+        "icd11": "6A60", "dsm5": "296.4x",
+        "criteria": "Elevated/irritable mood + increased energy for >=1 week "
+                    "(or any duration if hospitalized) with 3+ manic symptoms.",
+        "differential": "Substance-induced mood, schizoaffective, ADHD, "
+                        "hyperthyroidism, steroid-induced mania.",
+    },
+    "Schizophrenia Spectrum Disorder": {
+        "icd11": "6A20", "dsm5": "295.90",
+        "criteria": ">=2 of: delusions, hallucinations, disorganized speech, "
+                    "disorganized behavior, negative symptoms; >=6 months.",
+        "differential": "Substance-induced psychosis, schizoaffective, "
+                        "bipolar with psychotic features, medical/neuro cause.",
+    },
+    "Delirium": {
+        "icd11": "6D70", "dsm5": "780.09",
+        "criteria": "Acute onset, fluctuating attention and awareness; "
+                    "secondary to medical/substance cause.",
+        "differential": "Dementia, psychosis, depression, mania.",
+    },
+    "Generalized Anxiety Disorder": {
+        "icd11": "6B00", "dsm5": "300.02",
+        "criteria": "Excessive worry >=6 months, difficult to control, with "
+                    "3+ of restlessness, fatigue, concentration, irritability, "
+                    "muscle tension, sleep disturbance.",
+        "differential": "Panic disorder, social anxiety, OCD, GAD secondary to "
+                        "medical (hyperthyroid, caffeine).",
+    },
+    "ADHD": {
+        "icd11": "6A05", "dsm5": "314.0x",
+        "criteria": ">=6 inattentive or >=6 hyperactive/impulsive symptoms, "
+                    "onset before 12, in 2+ settings, impairment.",
+        "differential": "Anxiety, depression, learning disorder, trauma, "
+                        "sleep disorder, substance use.",
+    },
+    "PTSD": {
+        "icd11": "6B40", "dsm5": "309.81",
+        "criteria": "Trauma exposure + intrusion, avoidance, negative cognitions, "
+                    "hyperarousal for >=1 month.",
+        "differential": "Acute stress disorder, adjustment disorder, depression, "
+                        "panic disorder, TBI.",
+    },
+    "OCD": {
+        "icd11": "6B20", "dsm5": "300.3",
+        "criteria": "Obsessions and/or compulsions that are time-consuming "
+                    "or cause distress/impairment.",
+        "differential": "GAD, specific phobia, tic disorder, OCD personality.",
+    },
+    "Panic Disorder": {
+        "icd11": "6B01", "dsm5": "300.01",
+        "criteria": "Recurrent unexpected panic attacks + >=1 month of "
+                    "persistent concern or maladaptive behavior.",
+        "differential": "Medical causes (cardiac, thyroid, pheo), substance use, "
+                        "GAD, social anxiety.",
+    },
+    "Substance Use Disorder": {
+        "icd11": "6C4x", "dsm5": "various",
+        "criteria": ">=2 of 11 criteria within 12 months (control, impairment, "
+                    "risky use, pharmacological criteria).",
+        "differential": "Primary psychiatric disorder with secondary use, "
+                        "medical cause, dual diagnosis.",
+    },
 }
 
-symptom_weights = {
-    "Low mood": 0.15, "Anhedonia": 0.15, "Fatigue": 0.10, "Hopelessness": 0.12,
-    "Excessive guilt": 0.08, "Suicidal thoughts": 0.20, "Sleep disturbance": 0.10,
-    "Irritability": 0.05, "Reduced sleep": 0.15, "Increased energy": 0.15,
-    "Grandiosity": 0.12, "Pressured speech": 0.10, "Racing thoughts": 0.12,
-    "Auditory hallucinations": 0.20, "Delusions": 0.20, "Paranoia": 0.12,
-    "Negative symptoms": 0.15, "Poor concentration": 0.10,
-}
+# 6 - drug interaction table (well-established, non-exhaustive)
+DRUG_INTERACTIONS = [
+    ("SSRI", "MAOI", "Severe", "Serotonin syndrome risk - avoid; 14-day washout."),
+    ("SSRI", "Triptan", "Moderate", "Serotonin syndrome risk; monitor."),
+    ("SSRI", "NSAID", "Moderate", "Increased GI bleeding; consider PPI."),
+    ("SSRI", "Warfarin", "Severe", "Increased bleeding; monitor INR."),
+    ("SSRI", "Tramadol", "Moderate", "Seizure + serotonin syndrome risk."),
+    ("Lithium", "NSAID", "Severe", "Lithium toxicity - avoid or monitor levels."),
+    ("Lithium", "ACE-I/ARB", "Severe", "Lithium toxicity risk; monitor levels."),
+    ("Lithium", "Thiazide", "Severe", "Lithium toxicity risk; monitor levels."),
+    ("Valproate", "Lamotrigine", "Severe", "Stevens-Johnson risk; halve lamotrigine."),
+    ("Valproate", "Carbamazepine", "Moderate", "Reduced valproate levels."),
+    ("Clozapine", "Carbamazepine", "Severe", "Agranulocytosis risk; avoid."),
+    ("Clozapine", "Caffeine", "Moderate", "Increased clozapine levels."),
+    ("Olanzapine", "Benzodiazepine", "Moderate", "Excess sedation; caution."),
+    ("Haloperidol", "QT-prolongers", "Severe", "Additive QT prolongation."),
+    ("Benzodiazepine", "Opioid", "Severe", "Respiratory depression - avoid."),
+    ("Benzodiazepine", "Alcohol", "Severe", "Respiratory depression, overdose."),
+    ("TCA", "MAOI", "Severe", "Hypertensive crisis - avoid."),
+    ("TCA", "SSRI", "Severe", "Serotonin syndrome; 2-week washout."),
+    ("Antipsychotic", "Metformin", "Minor", "Weight gain mitigation."),
+    ("Lamotrigine", "OCP", "Moderate", "OCP reduces lamotrigine levels."),
+]
 
 medication_database = {
     "Major Depressive Disorder": {
@@ -185,7 +446,7 @@ medication_database = {
              "contraindications": "MAOIs, pimozide"},
             {"name": "Fluoxetine", "class": "SSRI", "starting_dose": "20mg",
              "max_dose": "80mg",
-             "side_effects": "Nervousness, anxiety, insomnia, weight changes",
+             "side_effects": "Nervousness, anxiety, insomnia",
              "contraindications": "MAOIs, thioridazine"},
         ],
         "second_line": [
@@ -242,8 +503,7 @@ medication_database = {
     "Generalized Anxiety Disorder": {
         "first_line": [
             {"name": "Sertraline", "class": "SSRI", "starting_dose": "25mg",
-             "max_dose": "200mg",
-             "side_effects": "Nausea, insomnia",
+             "max_dose": "200mg", "side_effects": "Nausea, insomnia",
              "contraindications": "MAOIs"},
         ],
     },
@@ -260,10 +520,9 @@ PHQ9_QUESTIONS = [
     "Moving or speaking slowly / being fidgety or restless",
     "Thoughts that you would be better off dead or of hurting yourself",
 ]
-
 GAD7_QUESTIONS = [
     "Feeling nervous, anxious, or on edge",
-    "Not being able to stop or control worrying",
+    "Not being able to control or stop worrying",
     "Worrying too much about different things",
     "Trouble relaxing",
     "Being so restless that it is hard to sit still",
@@ -271,1282 +530,1502 @@ GAD7_QUESTIONS = [
     "Feeling afraid as if something awful might happen",
 ]
 
-OPTIONS = ["Not at all (0)", "Several days (1)",
-           "More than half the days (2)", "Nearly every day (3)"]
-
-CHATBOT = {
-    "depression": [
-        "Major depression typically requires 4-6 weeks of antidepressant treatment for full response.",
-        "SSRIs are common first-line options.",
-        "CBT is highly effective for depression.",
-        "Monitor suicidal ideation early in treatment.",
-    ],
-    "mania": [
-        "Lithium therapeutic range usually 0.6-1.2 mEq/L.",
-        "Valproate needs liver monitoring.",
-        "Sleep deprivation can trigger mania.",
-        "Avoid antidepressants in acute mania.",
-    ],
-    "psychosis": [
-        "Early intervention improves outcomes.",
-        "Clozapine for treatment-resistant schizophrenia.",
-        "Metabolic monitoring with atypicals is essential.",
-    ],
-    "delirium": [
-        "Delirium is often reversible if cause is treated.",
-        "Common causes: infection, meds, metabolic issues.",
-        "Non-drug measures first.",
-    ],
-    "risk": [
-        "Repeat suicide risk assessment each visit.",
-        "Safety plans: triggers, coping, contacts.",
-        "Remove access to lethal means when high risk.",
-    ],
-    "medication": [
-        "Start low, go slow.",
-        "Full response may take 4-8 weeks.",
-        "Check drug interactions.",
-    ],
-    "phq9": [
-        "PHQ-9: 5-9 Mild, 10-14 Moderate, 15-19 Moderately severe, 20+ Severe.",
-        "Score >=10 usually needs treatment.",
-    ],
-    "gad7": [
-        "GAD-7: 5-9 Mild, 10-14 Moderate, 15+ Severe.",
-        "Score >=10 suggests clinically significant anxiety.",
-    ],
+# 4 - additional scales (short, single-page versions)
+SCALES = {
+    "C-SSRS (screen)": {
+        "questions": [
+            "Wished you were dead or wished you could go to sleep and not wake up?",
+            "Actually had thoughts of killing yourself?",
+            "Been thinking about how you might do this?",
+            "Had any intention of acting on these thoughts?",
+            "Started to work out or worked out the details of how to kill yourself?",
+            "Done anything, started to do anything, or prepared to do anything "
+            "to end your life?",
+        ],
+        "options": ["No (0)", "Yes (1)"],
+        "interpret": lambda s: ("Low" if s == 0 else
+                                "Moderate" if s <= 2 else
+                                "High" if s <= 4 else "Very High / immediate risk"),
+    },
+    "AUDIT-C (alcohol)": {
+        "questions": [
+            "How often do you have a drink containing alcohol?",
+            "How many standard drinks on a typical drinking day?",
+            "How often do you have six or more drinks on one occasion?",
+        ],
+        "options": ["0", "1", "2", "3", "4"],
+        "interpret": lambda s: ("Negative" if s <= 3 else
+                                "Positive screen - hazardous drinking"),
+    },
+    "DAST-10 (drugs)": {
+        "questions": [
+            "Used drugs other than those required for medical reasons?",
+            "Abused prescription drugs?",
+            "Always able to stop using drugs when you want? (reverse)",
+            "Had blackouts or flashbacks from drug use?",
+            "Felt bad or guilty about drug use?",
+            "Partner / parents / relatives complained about your drug use?",
+            "Neglected family or work obligations because of drugs?",
+            "Engaged in illegal activities to obtain drugs?",
+            "Experienced withdrawal symptoms when stopping?",
+            "Had medical problems from drug use?",
+        ],
+        "options": ["No (0)", "Yes (1)"],
+        "interpret": lambda s: ("Low" if s <= 2 else
+                                "Moderate" if s <= 5 else
+                                "Substantial" if s <= 8 else "Severe"),
+    },
+    "MDQ (bipolar screen)": {
+        "questions": [
+            "Felt so good or hyper that others thought you were not your normal self?",
+            "Felt so irritable you shouted at people or started fights?",
+            "Felt much more self-confident than usual?",
+            "Got much less sleep and did not miss it?",
+            "Much more talkative or spoke faster than usual?",
+            "Thoughts raced through your head or could not slow them down?",
+            "So easily distracted you had trouble concentrating?",
+            "Much more energy than usual?",
+            "Much more active or did many more things than usual?",
+            "Much more social or outgoing than usual?",
+            "Much more interested in sex than usual?",
+            "Did things unusual for you that others thought excessive or risky?",
+            "Spending money got you or your family into trouble?",
+        ],
+        "options": ["No (0)", "Yes (1)"],
+        "interpret": lambda s: ("Negative" if s <= 6 else "Positive screen"),
+    },
+    "PCL-5 (PTSD)": {
+        "questions": [
+            "Repeated disturbing memories, thoughts, or images of the stress?",
+            "Repeated disturbing dreams of the stress?",
+            "Suddenly feeling or acting as if the stress were happening again?",
+            "Feeling very upset when reminded of the stress?",
+            "Physical reactions when reminded of the stress?",
+            "Avoiding memories, thoughts, or feelings related to the stress?",
+            "Avoiding external reminders of the stress?",
+            "Trouble remembering important parts of the stress?",
+            "Negative beliefs about yourself, others, or the world?",
+            "Blaming yourself or others for the stress?",
+            "Strong negative feelings such as fear, horror, anger, guilt?",
+            "Loss of interest in activities you used to enjoy?",
+            "Feeling distant or cut off from other people?",
+            "Trouble experiencing positive feelings?",
+            "Irritable behavior, angry outbursts, or acting aggressively?",
+            "Taking too many risks or doing things that could cause harm?",
+            "Being superalert or watchful or on guard?",
+            "Feeling jumpy or easily startled?",
+            "Having difficulty concentrating?",
+            "Trouble falling or staying asleep?",
+        ],
+        "options": ["0 - Not at all", "1 - A little", "2 - Moderately",
+                    "3 - Quite a bit", "4 - Extremely"],
+        "interpret": lambda s: ("Below threshold" if s < 33 else
+                                "Probable PTSD (>32)"),
+    },
+    "YMRS (mania)": {
+        "questions": [
+            "Elevated mood (0-4)?",
+            "Increased motor activity / energy (0-4)?",
+            "Sexual interest (0-4)?",
+            "Sleep (0-4)?",
+            "Irritability (0-8)?",
+            "Speech rate / amount (0-8)?",
+            "Language / thought disorder (0-8)?",
+            "Content (0-8)?",
+            "Disruptive / aggressive behavior (0-8)?",
+            "Appearance (0-4)?",
+            "Insight (0-4)?",
+        ],
+        "options": ["0", "1", "2", "3", "4", "5", "6", "7", "8"],
+        "interpret": lambda s: ("Normal" if s <= 12 else
+                                "Hypomania" if s <= 19 else
+                                "Manic" if s <= 29 else "Severe mania"),
+    },
+    "MMSE (cognition)": {
+        "questions": [
+            "Orientation - year (0-1)?",
+            "Orientation - season (0-1)?",
+            "Orientation - date (0-1)?",
+            "Orientation - day (0-1)?",
+            "Orientation - month (0-1)?",
+            "Orientation - country (0-1)?",
+            "Orientation - state (0-1)?",
+            "Orientation - town/city (0-1)?",
+            "Orientation - hospital / place (0-1)?",
+            "Orientation - floor (0-1)?",
+            "Registration - 3 words (0-3)?",
+            "Attention - 5 serial 7s (0-5)?",
+            "Recall - 3 words (0-3)?",
+            "Language - naming (0-2)?",
+            "Language - repetition (0-1)?",
+            "Language - 3-stage command (0-3)?",
+            "Language - reading (0-1)?",
+            "Language - writing (0-1)?",
+            "Language - copy design (0-1)?",
+        ],
+        "options": ["0", "1", "2", "3", "4", "5"],
+        "interpret": lambda s: ("Normal (>=24)" if s >= 24 else
+                                "Mild (18-23)" if s >= 18 else
+                                "Moderate (10-17)" if s >= 10 else "Severe (<10)"),
+    },
 }
 
-GENERAL = [
-    "This is decision support only. Verify with guidelines.",
-    "Document clinical reasoning.",
-    "Regular follow-up is essential.",
-]
 
+# --------------------------- scoring (v4.x reused) -------------------------
+def has_s(sel, s): return s in sel
 
-def chatbot_reply(q):
-    q = q.lower()
-    km = {
-        "depression": "depression", "depressive": "depression", "mdd": "depression",
-        "phq": "phq9", "mania": "mania", "bipolar": "mania",
-        "psychosis": "psychosis", "schizophrenia": "psychosis",
-        "delirium": "delirium", "risk": "risk", "suicide": "risk",
-        "medication": "medication", "drug": "medication",
-        "gad": "gad7", "anxiety": "gad7",
+def severity_grader(score):
+    if score <= 5: return "Mild"
+    if score <= 12: return "Moderate"
+    if score <= 20: return "Severe"
+    return "Very Severe"
+
+def depressive_logic(sel, dur, aff):
+    if not (has_s(sel, "Low mood") or has_s(sel, "Anhedonia")): return 0
+    s = 12
+    for x in ["Fatigue","Hopelessness","Excessive guilt","Suicidal thoughts",
+              "Sleep disturbance","Poor concentration"]:
+        if has_s(sel, x): s += 2
+    if sum(1 for x in ["Grandiosity","Increased energy","Reduced sleep"]
+           if has_s(sel, x)) >= 2: s -= 8
+    if dur in ["Weeks","Months"]: s += 2
+    if aff == "Depressed": s += 3
+    return max(s, 0)
+
+def mania_logic(sel, dur, sp, th):
+    if not (has_s(sel,"Reduced sleep") and has_s(sel,"Increased energy")): return 0
+    s = 12
+    for x in ["Grandiosity","Pressured speech","Racing thoughts",
+              "Risk-taking behavior","Distractibility"]:
+        if has_s(sel, x): s += 2
+    if dur in ["Days","Weeks"]: s += 2
+    if sp == "Pressured": s += 3
+    if th == "Flight of ideas": s += 3
+    return max(s, 0)
+
+def psychosis_logic(sel, dur, sp, th):
+    if not (has_s(sel,"Auditory hallucinations")
+            or has_s(sel,"Visual hallucinations") or has_s(sel,"Delusions")):
+        return 0
+    s = 12
+    for x in ["Paranoia","Disorganized speech","Negative symptoms"]:
+        if has_s(sel, x): s += 2
+    if dur in ["Months","Years"]: s += 3
+    if sp == "Disorganized": s += 3
+    if th == "Disorganized": s += 4
+    return max(s, 0)
+
+def delirium_logic(sel, dur, onset, fluc):
+    if not (has_s(sel,"Confusion") and has_s(sel,"Disorientation")): return 0
+    s = 15
+    if has_s(sel,"Fluctuating attention") or has_s(sel,"Visual hallucinations"): s += 3
+    if dur in ["Hours","Days"]: s += 5
+    if onset == "Sudden": s += 4
+    if fluc: s += 4
+    return max(s, 0)
+
+def diagnose_mdd(sel, dur, imp):
+    cnt = sum(1 for x in ["Low mood","Anhedonia","Fatigue","Hopelessness",
+                          "Excessive guilt","Suicidal thoughts",
+                          "Sleep disturbance","Poor concentration"] if has_s(sel, x))
+    core = has_s(sel,"Low mood") or has_s(sel,"Anhedonia")
+    nom = not (has_s(sel,"Grandiosity") or has_s(sel,"Increased energy"))
+    if cnt >= 5 and core and nom and dur in ["Weeks","Months"] and imp != "None reported":
+        return {"diagnosis":"Major Depressive Disorder","status":"CRITERIA FULLY MET","confidence":"HIGH"}
+    if cnt >= 3:
+        return {"diagnosis":"Major Depressive Disorder","status":"PARTIAL CRITERIA","confidence":"MODERATE"}
+    return None
+
+def diagnose_mania(sel, dur):
+    cnt = sum(1 for x in ["Reduced sleep","Increased energy","Grandiosity",
+                          "Pressured speech","Racing thoughts",
+                          "Risk-taking behavior","Distractibility"] if has_s(sel, x))
+    if cnt >= 4 and has_s(sel,"Reduced sleep") and has_s(sel,"Increased energy") \
+       and dur in ["Days","Weeks"]:
+        return {"diagnosis":"Bipolar I Disorder - Manic Episode","status":"CRITERIA FULLY MET","confidence":"HIGH"}
+    return None
+
+def diagnose_schizophrenia(sel, dur):
+    core = has_s(sel,"Delusions") or has_s(sel,"Auditory hallucinations")
+    cnt = sum(1 for x in ["Auditory hallucinations","Visual hallucinations",
+                          "Delusions","Paranoia","Disorganized speech",
+                          "Negative symptoms"] if has_s(sel, x))
+    if core and cnt >= 2 and dur in ["Months","Years"]:
+        return {"diagnosis":"Schizophrenia Spectrum Disorder","status":"CRITERIA FULLY MET","confidence":"HIGH"}
+    return None
+
+def diagnose_delirium(sel, dur, fluc):
+    if has_s(sel,"Confusion") and has_s(sel,"Disorientation") \
+       and (has_s(sel,"Fluctuating attention") or fluc) and dur in ["Hours","Days"]:
+        return {"diagnosis":"Delirium","status":"CRITERIA FULLY MET","confidence":"HIGH"}
+    return None
+
+def organic_psychosis_detector(sel, onset, fluc, sz, focal, hi):
+    sc = 0
+    if has_s(sel,"Visual hallucinations"): sc += 3
+    if has_s(sel,"Confusion"): sc += 4
+    if fluc: sc += 4
+    if sz: sc += 4
+    if focal: sc += 5
+    if onset == "Sudden": sc += 3
+    if hi: sc += 4
+    if sc >= 15: lvl = "VERY HIGH suspicion of organic psychosis"
+    elif sc >= 10: lvl = "HIGH suspicion of organic psychosis"
+    elif sc >= 6: lvl = "MODERATE suspicion of organic psychosis"
+    else: lvl = "LOW suspicion of organic psychosis"
+    return lvl, sc
+
+def risk_assessment(sel, plan, cmd, vio, means):
+    sc = 0
+    if has_s(sel,"Suicidal thoughts"): sc += 3
+    if plan: sc += 6
+    if cmd: sc += 6
+    if vio: sc += 5
+    if means: sc += 4
+    if sc >= 15: return "CRITICAL RISK", "IMMEDIATE HOSPITALIZATION REQUIRED", sc
+    if sc >= 10: return "HIGH RISK", "URGENT psychiatric consultation required", sc
+    if sc >= 5: return "MODERATE RISK", "Enhanced monitoring required", sc
+    return "LOW RISK", "Routine monitoring", sc
+
+def mixed_features_detector(sel):
+    dep = sum(1 for x in ["Low mood","Anhedonia","Hopelessness",
+                          "Excessive guilt","Suicidal thoughts"] if has_s(sel, x))
+    man = sum(1 for x in ["Reduced sleep","Increased energy","Grandiosity",
+                          "Pressured speech","Racing thoughts"] if has_s(sel, x))
+    return dep >= 3 and man >= 3
+
+def generate_mse(sp, aff, th, ins, jud):
+    sm = {"Normal":"normal rate and rhythm","Pressured":"rapid, difficult to interrupt",
+          "Slow":"reduced rate","Disorganized":"disorganized"}
+    am = {"Normal":"full range","Flat":"severely reduced",
+          "Depressed":"sad, discouraged","Labile":"rapidly changing"}
+    tm = {"Normal":"logical and goal-directed","Tangential":"off-topic",
+          "Disorganized":"illogical","Flight of ideas":"rapid shifts"}
+    im = {"Good":"excellent awareness","Partial":"partial recognition","Poor":"limited awareness"}
+    jm = {"Good":"intact","Fair":"mildly impaired","Poor":"moderately impaired",
+          "Impaired":"markedly impaired"}
+    return ("Speech: " + sm.get(sp, "normal") + ". "
+            "Affect: " + am.get(aff, "normal") + ". "
+            "Thought: " + tm.get(th, "normal") + ". "
+            "Insight: " + im.get(ins, "good") + ". "
+            "Judgment: " + jm.get(jud, "intact") + ".")
+
+def generate_ai_insights(top, sev, risk, formal):
+    L = ["### Clinical Overview",
+         "Primary presentation: **" + top + "** (" + sev.lower() + " severity)."]
+    if formal:
+        names = [d["diagnosis"] for d in formal if d.get("status") == "CRITERIA FULLY MET"]
+        if names:
+            L += ["", "### Criteria",
+                  "Meets criteria for: **" + ", ".join(names) + "** (decision support only)."]
+    L += ["", "### Risk"]
+    if "HIGH" in risk or "CRITICAL" in risk:
+        L.append("High/critical risk - do not leave unattended; remove means; "
+                 "emergency services; consider admission.")
+    elif "MODERATE" in risk:
+        L.append("Moderate risk - enhanced monitoring and safety planning.")
+    else:
+        L.append("Low risk - routine monitoring.")
+    L += ["", "### Notes - " + top]
+    edu = {
+        "Depressive Syndrome": ["SSRIs + CBT first-line.",
+                                "Monitor suicide risk early in treatment.",
+                                "Rule out medical causes."],
+        "Manic Syndrome": ["Lithium/valproate first-line.",
+                           "Avoid antidepressants in acute mania.",
+                           "Monitor levels/LFTs."],
+        "Psychotic Syndrome": ["Antipsychotics first-line.",
+                               "Early intervention improves outcomes.",
+                               "Rule out substance/medical causes."],
+        "Delirium Syndrome": ["Medical emergency - treat cause.",
+                              "Non-pharm measures first.",
+                              "Haloperidol only if severe agitation."],
     }
-    for k, cat in km.items():
-        if k in q:
-            return random.choice(CHATBOT.get(cat, GENERAL))
-    return random.choice(GENERAL)
+    for x in edu.get(top, ["Correlate with full clinical assessment."]):
+        L.append("- " + x)
+    L += ["", "### Follow-up",
+          "Reassess 1-2 weeks; monitor adherence/side effects; recheck risk each visit."]
+    return "\n".join(L)
+
+def phq9_severity(s):
+    return ("None-Minimal" if s <= 4 else "Mild" if s <= 9 else
+            "Moderate" if s <= 14 else "Moderately Severe" if s <= 19 else "Severe")
+
+def gad7_severity(s):
+    return ("Minimal" if s <= 4 else "Mild" if s <= 9 else
+            "Moderate" if s <= 14 else "Severe")
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-def canvas_to_b64_png(image_data):
-    """Convert st_canvas numpy RGBA array to a base64 PNG data URL."""
-    if image_data is None:
-        return ""
-    arr = image_data
-    if arr.dtype != "uint8":
-        arr = arr.astype("uint8")
-    img = Image.fromarray(arr, "RGBA")
+# --------------------------- PDF (3) ---------------------------------------
+def report_to_pdf(text, title="PsychAssist Clinical Report"):
+    if not HAS_FPDF:
+        return None
+    pdf = FPDF()
+    pdf.set_auto_page_break(auto=True, margin=15)
+    pdf.add_page()
+    pdf.set_font("Helvetica", "B", 14)
+    pdf.cell(0, 10, title, ln=1)
+    pdf.set_font("Helvetica", size=10)
+    for line in text.split("\n"):
+        pdf.multi_cell(0, 5, line)
+    out = pdf.output(dest="S")
+    if isinstance(out, str):
+        return out.encode("latin-1", "replace")
+    return bytes(out)
+
+
+# --------------------------- Excel (30) ------------------------------------
+def export_excel(tables):
+    if not HAS_OPENPYXL:
+        return None
     buf = io.BytesIO()
-    img.save(buf, format="PNG")
+    with pd.ExcelWriter(buf, engine="openpyxl") as xl:
+        c = db()
+        for t in tables:
+            try:
+                df = pd.read_sql_query("SELECT * FROM " + t, c._raw)
+            except Exception:
+                continue
+            df.to_excel(xl, sheet_name=t[:31], index=False)
+        c.close()
+    return buf.getvalue()
+
+
+# --------------------------- canvas helpers (2,12) -------------------------
+def canvas_to_b64_png(arr):
+    if arr is None: return ""
+    if arr.dtype != "uint8": arr = arr.astype("uint8")
+    buf = io.BytesIO()
+    Image.fromarray(arr, "RGBA").save(buf, format="PNG")
     return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
 
 
 def _toggle_fullscreen():
-    """on_click callback for the full-screen toggle button.
-
-    Runs BEFORE widgets are re-instantiated, so it is safe to mutate
-    a widget's session_state key here.
-    """
-    st.session_state.draw_fullscreen = not st.session_state.get(
-        "draw_fullscreen", False
-    )
+    st.session_state.draw_fullscreen = not st.session_state.get("draw_fullscreen", False)
 
 
-def has_s(selected, s):
-    return s in selected
+def _clipboard_history():
+    if "canvas_history" not in st.session_state:
+        st.session_state.canvas_history = []
+    return st.session_state.canvas_history
 
 
-def severity_grader(score):
-    if score <= 5:
-        return "Mild"
-    if score <= 12:
-        return "Moderate"
-    if score <= 20:
-        return "Severe"
-    return "Very Severe"
+# --------------------------- sidebar (9,10,14,23,27) -----------------------
+def sidebar_context():
+    with st.sidebar:
+        st.title("PsychAssist v5.0")
+        st.caption("Decision support only - not a diagnosis")
+
+        if USE_AUTH:
+            u = st.session_state.get("user", "?")
+            st.caption("Signed in as: " + u)
+            if st.button("Sign out"):
+                st.session_state.authed = False
+                st.rerun()
+
+        # 10 - global patient selector
+        c = db()
+        try:
+            pats = [r[0] for r in c.execute(
+                "SELECT name FROM patients WHERE deleted_at IS NULL ORDER BY name"
+            ).fetchall()]
+        except Exception:
+            pats = []
+        c.close()
+
+        options = ["(none)"] + pats
+        default = st.session_state.get("patient_name", "(none)")
+        if default not in options:
+            default = "(none)"
+        sel = st.selectbox("Current patient", options,
+                           index=options.index(default), key="global_patient")
+        st.session_state.patient_name = "" if sel == "(none)" else sel
+
+        # 9 - badges
+        c = db()
+        try:
+            overdue = c.execute(
+                "SELECT COUNT(*) FROM follow_ups WHERE status='Scheduled' "
+                "AND follow_up_date < ? AND deleted_at IS NULL",
+                (str(date.today()),)
+            ).fetchone()
+            overdue = overdue[0] if overdue else 0
+            high = c.execute(
+                "SELECT COUNT(*) FROM assessments WHERE (risk_level LIKE ? "
+                "OR risk_level LIKE ?) AND deleted_at IS NULL",
+                ("%HIGH%", "%CRITICAL%")
+            ).fetchone()
+            high = high[0] if high else 0
+        except Exception:
+            overdue, high = 0, 0
+        c.close()
+
+        if overdue:
+            st.error("Overdue follow-ups: " + str(overdue))
+        if high:
+            st.warning("Open high-risk: " + str(high))
+
+        # 14 - dark mode
+        dark = st.toggle("Dark mode", key="dark_mode")
+        if dark:
+            st.markdown(
+                "<style>"
+                ".stApp {background-color:#0e1117;color:#fafafa;}"
+                ".block-container {color:#fafafa;}"
+                "</style>", unsafe_allow_html=True)
 
 
-def normalize_scores(d):
-    t = sum(d.values())
-    if t == 0:
-        return d
-    return {k: round((v / t) * 100, 2) for k, v in d.items()}
+# --------------------------- treatment tracker (1) -------------------------
+def page_treatments():
+    st.title("Treatment Tracker")
 
+    with st.form("tx_add"):
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            name = st.text_input("Patient", value=st.session_state.get("patient_name", ""))
+            med = st.text_input("Medication")
+            cls = st.selectbox("Class", ["SSRI", "SNRI", "NDRI", "TCA", "MAOI",
+                                          "Atypical Antipsychotic",
+                                          "Typical Antipsychotic",
+                                          "Mood Stabilizer", "Anticonvulsant",
+                                          "Benzodiazepine", "Stimulant", "Other"])
+        with c2:
+            dose = st.text_input("Dose (e.g. 50mg)")
+            freq = st.text_input("Frequency (e.g. OD)")
+            route = st.selectbox("Route", ["Oral", "IM", "IV", "SC", "Other"])
+        with c3:
+            start = st.date_input("Start date", value=date.today())
+            psycho = st.text_input("Psychotherapy (if any)")
+            notes = st.text_area("Notes", height=80)
 
-def depressive_logic(selected, duration, affect):
-    if not (has_s(selected, "Low mood") or has_s(selected, "Anhedonia")):
-        return 0
-    score = 12
-    for s in ["Fatigue", "Hopelessness", "Excessive guilt",
-              "Suicidal thoughts", "Sleep disturbance", "Poor concentration"]:
-        if has_s(selected, s):
-            score += 2
-    if sum(1 for s in ["Grandiosity", "Increased energy", "Reduced sleep"]
-           if has_s(selected, s)) >= 2:
-        score -= 8
-    if duration in ["Weeks", "Months"]:
-        score += 2
-    if affect == "Depressed":
-        score += 3
-    return max(score, 0)
+        add = st.form_submit_button("Start medication")
+        if add and name.strip() and med.strip():
+            c = db()
+            c.execute(
+                "INSERT INTO treatments (patient_name, medication_name, medication_class, "
+                "dose, frequency, route, start_date, status, psychotherapy, notes, "
+                "created_by, timestamp) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                (name.strip(), med.strip(), cls, dose, freq, route, str(start),
+                 "Active", psycho, notes, st.session_state.get("user", "?"),
+                 str(datetime.now()))
+            )
+            c.commit()
+            c.close()
+            audit("insert", "treatments", detail=name + "/" + med)
+            st.success("Saved.")
 
+    st.divider()
+    st.subheader("Active medications")
+    c = db()
+    rows = c.execute(
+        "SELECT id, patient_name, medication_name, medication_class, dose, "
+        "frequency, start_date, status, adherence, side_effects "
+        "FROM treatments WHERE deleted_at IS NULL AND status='Active' "
+        "ORDER BY id DESC"
+    ).fetchall()
+    c.close()
 
-def mania_logic(selected, duration, speech, thought):
-    if not (has_s(selected, "Reduced sleep") and has_s(selected, "Increased energy")):
-        return 0
-    score = 12
-    for s in ["Grandiosity", "Pressured speech", "Racing thoughts",
-              "Risk-taking behavior", "Distractibility"]:
-        if has_s(selected, s):
-            score += 2
-    if duration in ["Days", "Weeks"]:
-        score += 2
-    if speech == "Pressured":
-        score += 3
-    if thought == "Flight of ideas":
-        score += 3
-    return max(score, 0)
-
-
-def psychosis_logic(selected, duration, speech, thought):
-    if not (has_s(selected, "Auditory hallucinations")
-            or has_s(selected, "Visual hallucinations")
-            or has_s(selected, "Delusions")):
-        return 0
-    score = 12
-    for s in ["Paranoia", "Disorganized speech", "Negative symptoms"]:
-        if has_s(selected, s):
-            score += 2
-    if duration in ["Months", "Years"]:
-        score += 3
-    if speech == "Disorganized":
-        score += 3
-    if thought == "Disorganized":
-        score += 4
-    return max(score, 0)
-
-
-def delirium_logic(selected, duration, onset, fluctuating):
-    if not (has_s(selected, "Confusion") and has_s(selected, "Disorientation")):
-        return 0
-    score = 15
-    if has_s(selected, "Fluctuating attention") or has_s(selected, "Visual hallucinations"):
-        score += 3
-    if duration in ["Hours", "Days"]:
-        score += 5
-    if onset == "Sudden":
-        score += 4
-    if fluctuating:
-        score += 4
-    return max(score, 0)
-
-
-def diagnose_mdd(selected, duration, impairment):
-    cnt = sum(1 for s in ["Low mood", "Anhedonia", "Fatigue", "Hopelessness",
-                          "Excessive guilt", "Suicidal thoughts",
-                          "Sleep disturbance", "Poor concentration"]
-              if has_s(selected, s))
-    core = has_s(selected, "Low mood") or has_s(selected, "Anhedonia")
-    no_mania = not (has_s(selected, "Grandiosity") or has_s(selected, "Increased energy"))
-    if (cnt >= 5 and core and no_mania
-            and duration in ["Weeks", "Months"]
-            and impairment != "None reported"):
-        return {"diagnosis": "Major Depressive Disorder",
-                "status": "CRITERIA FULLY MET", "confidence": "HIGH"}
-    if cnt >= 3:
-        return {"diagnosis": "Major Depressive Disorder",
-                "status": "PARTIAL CRITERIA", "confidence": "MODERATE"}
-    return None
-
-
-def diagnose_mania(selected, duration):
-    cnt = sum(1 for s in ["Reduced sleep", "Increased energy", "Grandiosity",
-                          "Pressured speech", "Racing thoughts",
-                          "Risk-taking behavior", "Distractibility"]
-              if has_s(selected, s))
-    if (cnt >= 4
-            and has_s(selected, "Reduced sleep")
-            and has_s(selected, "Increased energy")
-            and duration in ["Days", "Weeks"]):
-        return {"diagnosis": "Bipolar I Disorder - Manic Episode",
-                "status": "CRITERIA FULLY MET", "confidence": "HIGH"}
-    return None
-
-
-def diagnose_schizophrenia(selected, duration):
-    core = has_s(selected, "Delusions") or has_s(selected, "Auditory hallucinations")
-    cnt = sum(1 for s in ["Auditory hallucinations", "Visual hallucinations",
-                          "Delusions", "Paranoia", "Disorganized speech",
-                          "Negative symptoms"] if has_s(selected, s))
-    if core and cnt >= 2 and duration in ["Months", "Years"]:
-        return {"diagnosis": "Schizophrenia Spectrum Disorder",
-                "status": "CRITERIA FULLY MET", "confidence": "HIGH"}
-    return None
-
-
-def diagnose_delirium(selected, duration, fluctuating):
-    if (has_s(selected, "Confusion")
-            and has_s(selected, "Disorientation")
-            and (has_s(selected, "Fluctuating attention") or fluctuating)
-            and duration in ["Hours", "Days"]):
-        return {"diagnosis": "Delirium", "status": "CRITERIA FULLY MET",
-                "confidence": "HIGH"}
-    return None
-
-
-def organic_psychosis_detector(selected, onset, fluctuating, seizure, focal, head_injury):
-    score = 0
-    if has_s(selected, "Visual hallucinations"):
-        score += 3
-    if has_s(selected, "Confusion"):
-        score += 4
-    if fluctuating:
-        score += 4
-    if seizure:
-        score += 4
-    if focal:
-        score += 5
-    if onset == "Sudden":
-        score += 3
-    if head_injury:
-        score += 4
-    if score >= 15:
-        level = "VERY HIGH suspicion of organic psychosis"
-    elif score >= 10:
-        level = "HIGH suspicion of organic psychosis"
-    elif score >= 6:
-        level = "MODERATE suspicion of organic psychosis"
+    if not rows:
+        st.info("No active medications.")
     else:
-        level = "LOW suspicion of organic psychosis"
-    return level, score
+        for r in rows:
+            with st.expander("#" + str(r[0]) + " - " + str(r[1]) + " - "
+                             + str(r[2]) + " " + str(r[4]) + " " + str(r[5])):
+                a1, a2 = st.columns(2)
+                with a1:
+                    st.write("Class:", r[3])
+                    st.write("Started:", r[6])
+                with a2:
+                    adh = st.selectbox("Adherence", ["Good", "Partial", "Poor"],
+                                       key="adh_" + str(r[0]))
+                    se = st.text_input("Side effects", value=r[9] or "",
+                                       key="se_" + str(r[0]))
+                    if st.button("Update", key="upd_" + str(r[0])):
+                        c = db()
+                        c.execute("UPDATE treatments SET adherence=?, side_effects=? "
+                                  "WHERE id=?", (adh, se, r[0]))
+                        c.commit()
+                        c.close()
+                        audit("update", "treatments", r[0])
+                        st.success("Updated.")
+                reason = st.text_input("Reason to stop (if stopping)",
+                                       key="rs_" + str(r[0]))
+                if st.button("Stop medication", key="stop_" + str(r[0])):
+                    c = db()
+                    c.execute("UPDATE treatments SET status='Stopped', end_date=?, "
+                              "reason_stop=? WHERE id=?",
+                              (str(date.today()), reason, r[0]))
+                    c.commit()
+                    c.close()
+                    audit("stop", "treatments", r[0])
+                    st.success("Stopped.")
+                    st.rerun()
 
-
-def risk_assessment(selected, suicide_plan, command_hall, violent, access_means):
-    score = 0
-    if has_s(selected, "Suicidal thoughts"):
-        score += 3
-    if suicide_plan:
-        score += 6
-    if command_hall:
-        score += 6
-    if violent:
-        score += 5
-    if access_means:
-        score += 4
-    if score >= 15:
-        return "CRITICAL RISK", "IMMEDIATE HOSPITALIZATION REQUIRED", score
-    if score >= 10:
-        return "HIGH RISK", "URGENT psychiatric consultation required", score
-    if score >= 5:
-        return "MODERATE RISK", "Enhanced monitoring required", score
-    return "LOW RISK", "Routine monitoring", score
-
-
-def mixed_features_detector(selected):
-    dep = sum(1 for s in ["Low mood", "Anhedonia", "Hopelessness",
-                          "Excessive guilt", "Suicidal thoughts"]
-              if has_s(selected, s))
-    man = sum(1 for s in ["Reduced sleep", "Increased energy", "Grandiosity",
-                          "Pressured speech", "Racing thoughts"]
-              if has_s(selected, s))
-    return dep >= 3 and man >= 3
-
-
-def calculate_symptom_weight(selected):
-    return round(sum(symptom_weights.get(s, 0) for s in selected
-                     if s in symptom_weights), 2)
-
-
-def generate_mse(speech, affect, thought, insight, judgment):
-    sm = {"Normal": "normal rate and rhythm",
-          "Pressured": "rapid, difficult to interrupt",
-          "Slow": "reduced rate",
-          "Disorganized": "disorganized"}
-    am = {"Normal": "full range", "Flat": "severely reduced",
-          "Depressed": "sad, discouraged", "Labile": "rapidly changing"}
-    tm = {"Normal": "logical and goal-directed", "Tangential": "off-topic",
-          "Disorganized": "illogical", "Flight of ideas": "rapid shifts"}
-    im = {"Good": "excellent awareness", "Partial": "partial recognition",
-          "Poor": "limited awareness"}
-    jm = {"Good": "intact", "Fair": "mildly impaired",
-          "Poor": "moderately impaired", "Impaired": "markedly impaired"}
-    return (
-        "Speech: " + sm.get(speech, "normal") + ". "
-        "Affect: " + am.get(affect, "normal") + ". "
-        "Thought: " + tm.get(thought, "normal") + ". "
-        "Insight: " + im.get(insight, "good") + ". "
-        "Judgment: " + jm.get(judgment, "intact") + "."
+    st.divider()
+    st.subheader("History")
+    c = db()
+    df = pd.read_sql_query(
+        "SELECT id, patient_name, medication_name, dose, start_date, end_date, "
+        "status, adherence FROM treatments WHERE deleted_at IS NULL ORDER BY id DESC",
+        c._raw
     )
+    c.close()
+    st.dataframe(df, use_container_width=True)
 
 
-def generate_ai_insights(top, severity, risk_level, formal):
-    lines = []
-    lines.append("### Clinical Overview")
-    lines.append("Primary presentation: **" + top + "** (" + severity.lower() + " severity).")
+# --------------------------- more scales (4) -------------------------------
+def page_more_scales():
+    st.title("Additional Scales")
+    sel = st.selectbox("Choose scale", list(SCALES.keys()))
+    spec = SCALES[sel]
+    name = st.text_input("Patient", value=st.session_state.get("patient_name", ""))
 
-    if formal:
-        names = [d["diagnosis"] for d in formal if d.get("status") == "CRITERIA FULLY MET"]
-        if names:
-            lines.append("")
-            lines.append("### Criteria")
-            lines.append("Meets criteria for: **" + ", ".join(names) + "** (decision support only).")
+    scores = []
+    for i, q in enumerate(spec["questions"]):
+        v = st.selectbox(q, spec["options"], key="ms_" + sel + "_" + str(i))
+        try:
+            scores.append(int(v.split(" ")[0].split("(")[-1].rstrip(")") or 0))
+        except Exception:
+            scores.append(0)
 
-    lines.append("")
-    lines.append("### Risk")
-    if "HIGH" in risk_level or "CRITICAL" in risk_level:
-        lines.append("High/critical risk - do not leave unattended; remove means; "
-                     "emergency services; consider admission.")
-    elif "MODERATE" in risk_level:
-        lines.append("Moderate risk - enhanced monitoring and safety planning.")
-    else:
-        lines.append("Low risk - routine monitoring.")
+    total = sum(scores)
+    try:
+        sev = spec["interpret"](total)
+    except Exception:
+        sev = "-"
 
-    lines.append("")
-    lines.append("### Notes - " + top)
-    edu = {
-        "Depressive Syndrome": [
-            "SSRIs + CBT first-line.",
-            "Monitor suicide risk early in treatment.",
-            "Rule out medical causes.",
-        ],
-        "Manic Syndrome": [
-            "Lithium/valproate first-line.",
-            "Avoid antidepressants in acute mania.",
-            "Monitor levels/LFTs.",
-        ],
-        "Psychotic Syndrome": [
-            "Antipsychotics first-line.",
-            "Early intervention improves outcomes.",
-            "Rule out substance/medical causes.",
-        ],
-        "Delirium Syndrome": [
-            "Medical emergency - treat cause.",
-            "Non-pharm measures first.",
-            "Haloperidol only if severe agitation.",
-        ],
-    }
-    for x in edu.get(top, ["Correlate with full clinical assessment."]):
-        lines.append("- " + x)
+    st.success("Total: " + str(total) + " | " + str(sev))
 
-    lines.append("")
-    lines.append("### Follow-up")
-    lines.append("Reassess 1-2 weeks; monitor adherence/side effects; recheck risk each visit.")
-
-    return "\n".join(lines)
+    if st.button("Save scale"):
+        c = db()
+        c.execute(
+            "INSERT INTO other_scales (patient_name, scale, score, severity, answers, "
+            "created_by, timestamp) VALUES (?,?,?,?,?,?,?)",
+            (name or "Unknown", sel, total, str(sev), str(scores),
+             st.session_state.get("user", "?"), str(datetime.now()))
+        )
+        c.commit()
+        c.close()
+        audit("insert", "other_scales", detail=sel)
+        st.success("Saved.")
 
 
-def phq9_severity(score):
-    if score <= 4:
-        return "None-Minimal"
-    if score <= 9:
-        return "Mild"
-    if score <= 14:
-        return "Moderate"
-    if score <= 19:
-        return "Moderately Severe"
-    return "Severe"
+# --------------------------- ICD lookup (5) --------------------------------
+def page_icd():
+    st.title("ICD-11 / DSM-5-TR Lookup")
+    k = st.selectbox("Diagnosis", list(ICD_LOOKUP.keys()))
+    info = ICD_LOOKUP[k]
+    st.subheader(k)
+    st.write("**ICD-11:**", info["icd11"])
+    st.write("**DSM-5-TR:**", info["dsm5"])
+    st.markdown("**Criteria summary**")
+    st.write(info["criteria"])
+    st.markdown("**Common differentials**")
+    st.write(info["differential"])
 
 
-def gad7_severity(score):
-    if score <= 4:
-        return "Minimal"
-    if score <= 9:
-        return "Mild"
-    if score <= 14:
-        return "Moderate"
-    return "Severe"
+# --------------------------- drug interactions (6) -------------------------
+def page_interactions():
+    st.title("Drug Interaction Checker")
+    st.caption("Curated table - non-exhaustive. Always confirm with a full interaction database.")
+    st.subheader("Reference table")
+    df = pd.DataFrame(DRUG_INTERACTIONS,
+                      columns=["Drug A", "Drug B", "Severity", "Comment"])
+    st.dataframe(df, use_container_width=True)
+
+    st.subheader("Check a patient's active medications")
+    name = st.text_input("Patient", value=st.session_state.get("patient_name", ""))
+    if name:
+        c = db()
+        meds = c.execute(
+            "SELECT medication_name, medication_class FROM treatments "
+            "WHERE patient_name=? AND status='Active' AND deleted_at IS NULL",
+            (name,)
+        ).fetchall()
+        c.close()
+        if not meds:
+            st.info("No active medications for this patient.")
+        else:
+            classes = set(m[1] for m in meds)
+            hits = [row for row in DRUG_INTERACTIONS
+                    if row[0] in classes and row[1] in classes]
+            if hits:
+                for h in hits:
+                    st.error(h[0] + " + " + h[1] + " (" + h[2] + "): " + h[3])
+            else:
+                st.success("No known interactions from the curated table "
+                           "(this does not rule out others).")
 
 
-def upsert_patient(name, age, sex):
-    if not name or not name.strip():
+# --------------------------- trends (7,8) ----------------------------------
+def page_trends():
+    st.title("Trends")
+    name = st.text_input("Patient", value=st.session_state.get("patient_name", ""))
+    if not name:
+        st.info("Select a patient above.")
         return
-    conn = get_conn()
-    c = conn.cursor()
-    now = str(datetime.now())
-    c.execute("SELECT id FROM patients WHERE name = ?", (name.strip(),))
-    row = c.fetchone()
-    if row:
-        c.execute(
-            "UPDATE patients SET age=?, sex=?, last_seen=? WHERE name=?",
-            (age, sex, now, name.strip()),
+
+    c = db()
+    ass = pd.read_sql_query(
+        "SELECT timestamp, risk_level, severity FROM assessments "
+        "WHERE patient_name=? AND deleted_at IS NULL ORDER BY timestamp",
+        c._raw, params=(name,)
+    ) if not USE_PG else pd.DataFrame()
+    phq = pd.read_sql_query(
+        "SELECT timestamp, total_score FROM phq9_scores "
+        "WHERE patient_name=? AND deleted_at IS NULL ORDER BY timestamp",
+        c._raw, params=(name,)
+    )
+    gad = pd.read_sql_query(
+        "SELECT timestamp, total_score FROM gad7_scores "
+        "WHERE patient_name=? AND deleted_at IS NULL ORDER BY timestamp",
+        c._raw, params=(name,)
+    )
+    c.close()
+
+    if not ass.empty:
+        ass["t"] = pd.to_datetime(ass["timestamp"]).dt.date
+        st.subheader("Risk / severity timeline")
+        st.dataframe(ass[["t", "severity", "risk_level"]], use_container_width=True)
+
+    if not phq.empty:
+        phq["t"] = pd.to_datetime(phq["timestamp"]).dt.date
+        st.subheader("PHQ-9 over time")
+        st.line_chart(phq.set_index("t")["total_score"])
+
+    if not gad.empty:
+        gad["t"] = pd.to_datetime(gad["timestamp"]).dt.date
+        st.subheader("GAD-7 over time")
+        st.line_chart(gad.set_index("t")["total_score"])
+
+
+# --------------------------- outcomes (29) ---------------------------------
+def page_outcomes():
+    st.title("Outcome Dashboard")
+    c = db()
+    try:
+        fu = pd.read_sql_query(
+            "SELECT symptoms_improved, adherence, global_impression FROM follow_ups "
+            "WHERE status='Completed' AND deleted_at IS NULL", c._raw
         )
+    except Exception:
+        fu = pd.DataFrame()
+    c.close()
+
+    if fu.empty:
+        st.info("No completed follow-ups yet.")
+        return
+
+    a, b, d = st.columns(3)
+    with a:
+        st.subheader("Symptoms improved")
+        st.bar_chart(fu["symptoms_improved"].value_counts())
+    with b:
+        st.subheader("Adherence")
+        st.bar_chart(fu["adherence"].value_counts())
+    with d:
+        st.subheader("Global impression")
+        st.bar_chart(fu["global_impression"].value_counts())
+
+    n = len(fu)
+    improved = (fu["symptoms_improved"].isin(["Yes", "Partially"])).sum()
+    st.metric("Follow-ups completed", n)
+    st.metric("% improved or partially improved", str(round(100 * improved / n, 1)) + "%")
+
+
+# --------------------------- backup/restore (18) ---------------------------
+def page_backup():
+    st.title("Backup & Restore")
+    st.subheader("Download backup")
+
+    tables = ["assessments", "treatments", "phq9_scores", "gad7_scores",
+              "adhd_scores", "other_scales", "counselling_notes",
+              "follow_ups", "patients", "audit_log"]
+    xl = export_excel(tables)
+    if xl is None:
+        st.warning("Install openpyxl for Excel backup.")
     else:
-        c.execute(
-            "INSERT INTO patients (name, age, sex, first_seen, last_seen, created_at) "
-            "VALUES (?,?,?,?,?,?)",
-            (name.strip(), age, sex, now, now, now),
-        )
-    conn.commit()
-    conn.close()
+        st.download_button("Download backup (xlsx)", xl,
+                           file_name="psychassist_backup_" + str(date.today()) + ".xlsx",
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+    if not USE_PG and os.path.exists(DB_PATH):
+        with open(DB_PATH, "rb") as f:
+            st.download_button("Download SQLite DB", f.read(),
+                               file_name="psychassist_web.db",
+                               mime="application/x-sqlite3")
+
+    st.divider()
+    st.subheader("Restore SQLite DB")
+    up = st.file_uploader("Upload a .db file", type=["db", "sqlite", "sqlite3"])
+    if up and not USE_PG:
+        with open(DB_PATH, "wb") as f:
+            f.write(up.read())
+        st.success("Restored. Reload the app.")
+        st.rerun()
 
 
-# ---------------------------------------------------------------------------
-# Sidebar
-# ---------------------------------------------------------------------------
-st.sidebar.title("PsychAssist Web v4.4")
-st.sidebar.caption("Decision support only - not a diagnosis")
-
-page = st.sidebar.radio("Navigation", [
-    "Assessment", "PHQ-9", "GAD-7", "ADHD",
-    "Counselling & Notes", "Report",
-    "Chat", "History", "Patient Database", "Follow-up",
-    "Epidemiology", "Export Data",
-])
+# --------------------------- audit view (19) -------------------------------
+def page_audit():
+    st.title("Audit Log")
+    c = db()
+    df = pd.read_sql_query(
+        "SELECT ts, user, action, table_name, row_id, detail FROM audit_log "
+        "ORDER BY id DESC LIMIT 500", c._raw
+    )
+    c.close()
+    st.dataframe(df, use_container_width=True)
 
 
-# ---------------------------------------------------------------------------
-# Assessment
-# ---------------------------------------------------------------------------
+# --------------------------- auth gate kick-in -----------------------------
+if not check_auth():
+    st.stop()
+enforce_timeout()
+sidebar_context()
+
+
+# ===========================================================================
+# NAVIGATION
+# ===========================================================================
+pages = [
+    "Assessment", "PHQ-9", "GAD-7", "ADHD", "More Scales",
+    "Counselling & Notes", "Treatment Tracker", "Report", "Trends",
+    "ICD Lookup", "Drug Interactions", "Chat",
+    "History", "Patient Database", "Follow-up",
+    "Epidemiology", "Outcomes", "Audit Log",
+    "Backup & Restore", "Export Data",
+]
+page = st.sidebar.radio("Navigation", pages)
+
+
+# ===========================================================================
+# ASSESSMENT
+# ===========================================================================
 if page == "Assessment":
     st.title("Clinical Assessment")
-
-    with st.form("assessment_form"):
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            name = st.text_input("Patient Name", placeholder="Full name")
-            age = st.number_input("Age", min_value=1, max_value=120, value=30)
+    with st.form("af"):
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            name = st.text_input("Patient Name",
+                                 value=st.session_state.get("patient_name", ""))
+            age = st.number_input("Age", 1, 120, 30)
             sex = st.selectbox("Sex", ["Male", "Female", "Other"])
-        with col2:
-            duration = st.selectbox("Duration",
-                                    ["Hours", "Days", "Weeks", "Months", "Years"])
+        with c2:
+            duration = st.selectbox("Duration", ["Hours", "Days", "Weeks", "Months", "Years"])
             onset = st.selectbox("Onset", ["Sudden", "Gradual"])
-            pattern = st.selectbox("Pattern",
-                                   ["Not specified", "Episodic", "Chronic", "Fluctuating"])
-        with col3:
-            speech = st.selectbox("Speech",
-                                  ["Normal", "Pressured", "Slow", "Disorganized"])
-            affect = st.selectbox("Affect",
-                                  ["Normal", "Flat", "Depressed", "Labile"])
-            thought = st.selectbox("Thought",
-                                   ["Normal", "Tangential", "Disorganized",
-                                    "Flight of ideas"])
+            pattern = st.selectbox("Pattern", ["Not specified", "Episodic", "Chronic", "Fluctuating"])
+        with c3:
+            speech = st.selectbox("Speech", ["Normal", "Pressured", "Slow", "Disorganized"])
+            affect = st.selectbox("Affect", ["Normal", "Flat", "Depressed", "Labile"])
+            thought = st.selectbox("Thought", ["Normal", "Tangential", "Disorganized", "Flight of ideas"])
             insight = st.selectbox("Insight", ["Good", "Partial", "Poor"])
-            judgment = st.selectbox("Judgment",
-                                    ["Good", "Fair", "Poor", "Impaired"])
+            judgment = st.selectbox("Judgment", ["Good", "Fair", "Poor", "Impaired"])
 
-        substance = st.multiselect(
-            "Substance Use",
-            ["Alcohol", "Cannabis", "Stimulants", "Opioids", "Withdrawal"],
-        )
-        neuro = st.multiselect(
-            "Neuro Findings",
-            ["Head injury", "Fluctuating cognition", "Focal deficit",
-             "Seizure disorder"],
-        )
-        func_imp = st.multiselect(
-            "Impairment", ["Occupational", "Social", "Self-care"]
-        )
+        substance = st.multiselect("Substance Use",
+                                   ["Alcohol", "Cannabis", "Stimulants", "Opioids", "Withdrawal"])
+        neuro = st.multiselect("Neuro Findings",
+                               ["Head injury", "Fluctuating cognition", "Focal deficit",
+                                "Seizure disorder"])
+        func_imp = st.multiselect("Impairment", ["Occupational", "Social", "Self-care"])
 
         selected = []
         for cat, items in symptom_categories.items():
             st.write("**" + cat + "**")
-            for item in items:
-                if st.checkbox(item, key="sym_" + item):
-                    selected.append(item)
+            for it in items:
+                if st.checkbox(it, key="sy_" + it):
+                    selected.append(it)
 
         risk_suicide = st.checkbox("Active suicidal plan")
         risk_command = st.checkbox("Command hallucinations")
         risk_violent = st.checkbox("Violent behavior")
         risk_means = st.checkbox("Access to means")
+        sub = st.form_submit_button("Generate Report")
 
-        submitted = st.form_submit_button("Generate Report")
-
-        if submitted:
-            if not name:
-                st.error("Please enter patient name")
+        if sub:
+            if not name.strip():
+                st.error("Enter patient name")
             else:
-                upsert_patient(name, str(age), sex)
-                st.session_state.patient_name = name
+                # upsert patient
+                c = db()
+                now = str(datetime.now())
+                row = c.execute("SELECT id FROM patients WHERE name=?", (name.strip(),)).fetchone()
+                if row:
+                    c.execute("UPDATE patients SET age=?, sex=?, last_seen=? WHERE name=?",
+                              (str(age), sex, now, name.strip()))
+                else:
+                    c.execute("INSERT INTO patients (name, age, sex, first_seen, last_seen, "
+                              "created_at, created_by) VALUES (?,?,?,?,?,?,?)",
+                              (name.strip(), str(age), sex, now, now, now,
+                               st.session_state.get("user", "?")))
+                c.commit()
+                c.close()
 
                 onset_s = "Sudden" if onset == "Sudden" else "Gradual"
-                fluctuating = "Fluctuating cognition" in neuro
-                seizure = "Seizure disorder" in neuro
+                fluc = "Fluctuating cognition" in neuro
+                sz = "Seizure disorder" in neuro
                 focal = "Focal deficit" in neuro
-                head_injury = "Head injury" in neuro
+                hi = "Head injury" in neuro
 
-                dep_score = depressive_logic(selected, duration, affect)
-                man_score = mania_logic(selected, duration, speech, thought)
-                psych_score = psychosis_logic(selected, duration, speech, thought)
-                del_score = delirium_logic(selected, duration, onset_s, fluctuating)
-
-                filtered = {}
-                for k, v in [
-                    ("Depressive Syndrome", dep_score),
-                    ("Manic Syndrome", man_score),
-                    ("Psychotic Syndrome", psych_score),
-                    ("Delirium Syndrome", del_score),
-                ]:
-                    if v > 0:
-                        filtered[k] = v
-
-                if filtered:
-                    top_syndrome = max(filtered, key=filtered.get)
-                    severity = severity_grader(max(filtered.values()))
+                scores = {
+                    "Depressive Syndrome": depressive_logic(selected, duration, affect),
+                    "Manic Syndrome": mania_logic(selected, duration, speech, thought),
+                    "Psychotic Syndrome": psychosis_logic(selected, duration, speech, thought),
+                    "Delirium Syndrome": delirium_logic(selected, duration, onset_s, fluc),
+                }
+                filt = {k: v for k, v in scores.items() if v > 0}
+                if filt:
+                    top = max(filt, key=filt.get)
+                    sev = severity_grader(max(filt.values()))
                 else:
-                    top_syndrome = "Unknown"
-                    severity = severity_grader(0)
+                    top, sev = "Unknown", severity_grader(0)
 
-                impairment_str = " ".join(func_imp) if func_imp else "None reported"
+                imp = " ".join(func_imp) if func_imp else "None reported"
+                formal = [d for d in (
+                    diagnose_mdd(selected, duration, imp),
+                    diagnose_mania(selected, duration),
+                    diagnose_schizophrenia(selected, duration),
+                    diagnose_delirium(selected, duration, fluc),
+                ) if d]
 
-                formal = []
-                mdd = diagnose_mdd(selected, duration, impairment_str)
-                man = diagnose_mania(selected, duration)
-                sch = diagnose_schizophrenia(selected, duration)
-                dlm = diagnose_delirium(selected, duration, fluctuating)
-                for d in (mdd, man, sch, dlm):
-                    if d:
-                        formal.append(d)
+                org_lvl, org_sc = organic_psychosis_detector(
+                    selected, onset_s, fluc, sz, focal, hi)
+                risk_lvl, risk_rec, risk_sc = risk_assessment(
+                    selected, risk_suicide, risk_command, risk_violent, risk_means)
 
-                organic_level, organic_score = organic_psychosis_detector(
-                    selected, onset_s, fluctuating, seizure, focal, head_injury
-                )
-                risk_level, risk_rec, risk_score = risk_assessment(
-                    selected, risk_suicide, risk_command, risk_violent, risk_means
-                )
+                mse = generate_mse(speech, affect, thought, insight, judgment)
+                rep = "\n".join([
+                    "=" * 60,
+                    "PSYCHASSIST CLINICAL REPORT",
+                    "=" * 60, "",
+                    "Patient: " + name + " | Age: " + str(age) + " | Sex: " + sex,
+                    "Syndrome: " + top + " | Severity: " + sev, "",
+                    "MSE: " + mse, "",
+                    "Risk: " + risk_lvl + " (" + str(risk_sc) + "/20) - " + risk_rec,
+                    "Organic: " + org_lvl + " (" + str(org_sc) + "/25)",
+                ])
+                ai = generate_ai_insights(top, sev, risk_lvl, formal)
 
-                report_lines = [
-                    "============================================================",
-                    "                  PSYCHASSIST CLINICAL REPORT",
-                    "============================================================",
-                    "",
-                    "Patient: " + str(name) + " | Age: " + str(age) + " | Sex: " + str(sex),
-                    "Syndrome: " + str(top_syndrome) + " | Severity: " + str(severity),
-                    "",
-                    "MSE: " + generate_mse(speech, affect, thought, insight, judgment),
-                    "",
-                    "Risk: " + str(risk_level) + " (" + str(risk_score) + "/20) - " + str(risk_rec),
-                    "Organic: " + str(organic_level) + " (" + str(organic_score) + "/25)",
-                ]
-                report_text = "\n".join(report_lines)
-
-                ai_text = generate_ai_insights(top_syndrome, severity,
-                                               risk_level, formal)
-
-                conn = get_conn()
-                c = conn.cursor()
+                c = db()
                 c.execute(
-                    "INSERT INTO assessments ("
-                    "patient_name, age, sex, symptoms, syndrome, severity, risk_level,"
-                    "formal_diagnoses, organic_level, organic_score, functional_impairment,"
-                    "mse, duration, onset, pattern, speech, affect, thought_process,"
-                    "insight, judgment, substance_use, neuro_findings, report_text,"
-                    "ai_insights, mdd_criteria, mania_criteria, schizophrenia_criteria,"
-                    "delirium_criteria, mixed_features, symptom_weight, timestamp"
-                    ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                    (
-                        name, str(age), sex, ", ".join(selected), top_syndrome,
-                        severity, risk_level, str(formal), organic_level,
-                        organic_score, ", ".join(func_imp),
-                        generate_mse(speech, affect, thought, insight, judgment),
-                        duration, onset, pattern, speech, affect, thought, insight,
-                        judgment, ", ".join(substance), ", ".join(neuro),
-                        report_text, ai_text,
-                        str(mdd) if mdd else "",
-                        str(man) if man else "",
-                        str(sch) if sch else "",
-                        str(dlm) if dlm else "",
-                        1 if mixed_features_detector(selected) else 0,
-                        calculate_symptom_weight(selected),
-                        str(datetime.now()),
-                    ),
+                    "INSERT INTO assessments (patient_name, age, sex, symptoms, syndrome, "
+                    "severity, risk_level, formal_diagnoses, organic_level, organic_score, "
+                    "functional_impairment, mse, duration, onset, pattern, speech, affect, "
+                    "thought_process, insight, judgment, substance_use, neuro_findings, "
+                    "report_text, ai_insights, mdd_criteria, mania_criteria, "
+                    "schizophrenia_criteria, delirium_criteria, mixed_features, "
+                    "symptom_weight, created_by, timestamp) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (name, str(age), sex, ", ".join(selected), top, sev, risk_lvl,
+                     str(formal), org_lvl, org_sc, ", ".join(func_imp), mse,
+                     duration, onset, pattern, speech, affect, thought, insight,
+                     judgment, ", ".join(substance), ", ".join(neuro), rep, ai,
+                     str(formal[0]) if formal else "", "", "", "",
+                     1 if mixed_features_detector(selected) else 0,
+                     round(sum(0.1 for _ in selected), 2),
+                     st.session_state.get("user", "?"), str(datetime.now()))
                 )
-                conn.commit()
-                conn.close()
-
-                st.session_state["current_report"] = report_text
-                st.session_state["current_ai"] = ai_text
-                st.success("Report generated! Open the Report page to view it.")
+                c.commit()
+                c.close()
+                audit("insert", "assessments", detail=name)
+                st.session_state["current_report"] = rep
+                st.session_state["current_ai"] = ai
+                st.session_state.patient_name = name
+                st.success("Report generated.")
                 st.rerun()
 
 
-# ---------------------------------------------------------------------------
-# PHQ-9
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# PHQ-9 / GAD-7 / ADHD
+# ===========================================================================
 if page == "PHQ-9":
-    st.title("PHQ-9 Assessment")
-    st.session_state.patient_name = st.text_input(
-        "Patient Name", value=st.session_state.get("patient_name", "")
-    )
-    scores = {}
-    for i, q in enumerate(PHQ9_QUESTIONS):
-        scores[i] = st.slider(q, 0, 3, 0, key="phq9_" + str(i))
-    total = sum(scores.values())
-    st.success("Total: " + str(total) + " | " + phq9_severity(total))
+    st.title("PHQ-9")
+    name = st.text_input("Patient", value=st.session_state.get("patient_name", ""))
+    sc = [st.slider(q, 0, 3, 0, key="p" + str(i)) for i, q in enumerate(PHQ9_QUESTIONS)]
+    tot = sum(sc)
+    st.success("Total: " + str(tot) + " | " + phq9_severity(tot))
     if st.button("Save PHQ-9"):
-        conn = get_conn()
-        conn.execute(
-            "INSERT INTO phq9_scores (patient_name, total_score, severity, answers, timestamp) "
-            "VALUES (?,?,?,?,?)",
-            (st.session_state.get("patient_name", "Unknown"), total,
-             phq9_severity(total), str(scores), str(datetime.now())),
-        )
-        conn.commit()
-        conn.close()
-        st.success("Saved!")
+        c = db()
+        c.execute("INSERT INTO phq9_scores (patient_name, total_score, severity, answers, "
+                  "created_by, timestamp) VALUES (?,?,?,?,?,?)",
+                  (name or "Unknown", tot, phq9_severity(tot), str(sc),
+                   st.session_state.get("user", "?"), str(datetime.now())))
+        c.commit(); c.close()
+        audit("insert", "phq9_scores", detail=name)
+        st.success("Saved.")
 
-
-# ---------------------------------------------------------------------------
-# GAD-7
-# ---------------------------------------------------------------------------
 if page == "GAD-7":
-    st.title("GAD-7 Assessment")
-    st.session_state.patient_name = st.text_input(
-        "Patient Name", value=st.session_state.get("patient_name", "")
-    )
-    scores = {}
-    for i, q in enumerate(GAD7_QUESTIONS):
-        scores[i] = st.slider(q, 0, 3, 0, key="gad7_" + str(i))
-    total = sum(scores.values())
-    st.success("Total: " + str(total) + " | " + gad7_severity(total))
+    st.title("GAD-7")
+    name = st.text_input("Patient", value=st.session_state.get("patient_name", ""))
+    sc = [st.slider(q, 0, 3, 0, key="g" + str(i)) for i, q in enumerate(GAD7_QUESTIONS)]
+    tot = sum(sc)
+    st.success("Total: " + str(tot) + " | " + gad7_severity(tot))
     if st.button("Save GAD-7"):
-        conn = get_conn()
-        conn.execute(
-            "INSERT INTO gad7_scores (patient_name, total_score, severity, answers, timestamp) "
-            "VALUES (?,?,?,?,?)",
-            (st.session_state.get("patient_name", "Unknown"), total,
-             gad7_severity(total), str(scores), str(datetime.now())),
-        )
-        conn.commit()
-        conn.close()
-        st.success("Saved!")
+        c = db()
+        c.execute("INSERT INTO gad7_scores (patient_name, total_score, severity, answers, "
+                  "created_by, timestamp) VALUES (?,?,?,?,?,?)",
+                  (name or "Unknown", tot, gad7_severity(tot), str(sc),
+                   st.session_state.get("user", "?"), str(datetime.now())))
+        c.commit(); c.close()
+        audit("insert", "gad7_scores", detail=name)
+        st.success("Saved.")
 
-
-# ---------------------------------------------------------------------------
-# ADHD
-# ---------------------------------------------------------------------------
 if page == "ADHD":
     st.title("ADHD Assessment")
-    st.session_state.patient_name = st.text_input(
-        "Patient Name", value=st.session_state.get("patient_name", "")
-    )
-
-    col1, col2 = st.columns(2)
-    with col1:
-        adhd_type = st.radio(
-            "ADHD Type",
-            ["Adult (ASRS)", "Adult (CAARS)", "Child (ADHD-RS)"],
-            horizontal=True,
-        )
-        age_group = st.selectbox(
-            "Age Group", ["Adult", "Adolescent", "Child (<13 years)"]
-        )
-
-    with col2:
-        if adhd_type == "Adult (ASRS)":
-            asrs_questions = [
-                "How often do you have trouble wrapping up the final details of a project, once the challenging parts have been done?",
-                "How often do you have difficulty getting things in order when you have to do a task that requires organization?",
-                "How often do you have problems remembering appointments or obligations?",
-                "How often do you find that you have to read instructions over and over to understand them?",
-                "How often do you find yourself starting a new task before finishing the previous one?",
-                "How often do you find that you have trouble focusing your attention when you need to focus hard?",
-            ]
-            total = 0
-            for i, q in enumerate(asrs_questions):
-                total += st.slider(q, 0, 4, 0, key="asrs_" + str(i))
-            st.session_state.adhd_asrs = total
-        elif adhd_type == "Adult (CAARS)":
-            caars_questions = [
-                "I have difficulty concentrating on tasks.",
-                "I am easily distracted.",
-                "I find it hard to sit still in meetings.",
-                "I talk too much.",
-                "I interrupt others.",
-                "I lose things.",
-                "I forget appointments.",
-                "I have trouble organizing my daily activities.",
-                "I feel restless.",
-                "I have a short attention span.",
-            ]
-            total = 0
-            for i, q in enumerate(caars_questions):
-                total += st.slider(q, 0, 4, 0, key="caars_" + str(i))
-            st.session_state.adhd_caars = total
-        else:
-            adhd_rs_questions = [
-                "Often fidgets with hands or feet or squirms in seat",
-                "Leaves seat in classroom or in other situations in which remaining seated is expected",
-                "Runs about or climbs excessively in situations in which it is inappropriate",
-                "Has difficulty playing or engaging in leisure activities quietly",
-                "Is often on the go or acts as if 'driven by a motor'",
-                "Talks excessively",
-                "Blurts out answers before questions have been completed",
-                "Has difficulty awaiting turn",
-                "Interrupts or intrudes on others",
-                "Has difficulty organizing tasks and activities",
-            ]
-            total = 0
-            for i, q in enumerate(adhd_rs_questions):
-                total += st.slider(q, 0, 3, 0, key="adhd_rs_" + str(i))
-            st.session_state.adhd_rs = total
-
-    if st.button("Calculate ADHD Score & Diagnosis"):
-        if adhd_type == "Adult (ASRS)":
-            score = st.session_state.get("adhd_asrs", 0)
-            threshold = 18
-        elif adhd_type == "Adult (CAARS)":
-            score = st.session_state.get("adhd_caars", 0)
-            threshold = 30
-        else:
-            score = st.session_state.get("adhd_rs", 0)
-            threshold = 24
-
-        if score <= threshold // 2:
-            severity = "None"
-        elif score <= threshold:
-            severity = "Mild"
-        elif score <= threshold * 1.5:
-            severity = "Moderate"
-        else:
-            severity = "Severe"
-
-        st.success("ADHD Score: " + str(score) + "/" + str(threshold)
-                   + " | Severity: " + severity)
-
-        st.subheader("Differential Diagnosis")
-        diff = st.selectbox(
-            "Compare with",
-            ["No other diagnosis", "Major Depression", "Generalized Anxiety",
-             "Bipolar Disorder", "Learning Disorder", "Trauma/PTSD",
-             "Sleep Disorder"],
-        )
-        st.info("ADHD vs " + diff + ": Overlap possible in most cases.")
-
-        st.subheader("Treatment Recommendations")
-        if severity in ["Mild", "Moderate"]:
-            st.write("- Non-stimulant: Atomoxetine 40-100mg/day or Guanfacine 1-4mg")
-            st.write("- Behavioral therapy: CBT for ADHD or Coaching")
-            tx = "Non-stimulant; Behavioral therapy"
-        else:
-            st.write("- First-line stimulant: Methylphenidate 10-60mg or Amphetamine 10-60mg")
-            st.write("- Monitoring: BP, weight, sleep, growth in children")
-            tx = "Stimulant; Behavioral therapy; Monitoring"
-
-        conn = get_conn()
-        conn.execute(
-            "INSERT INTO assessments ("
-            "patient_name, syndrome, severity, adhd_score, adhd_type, adhd_severity, "
-            "differential, treatment_recommendations, timestamp"
-            ") VALUES (?,?,?,?,?,?,?,?,?)",
-            (
-                st.session_state.get("patient_name", "Unknown"),
-                "ADHD", severity, score, adhd_type, severity, diff, tx,
-                str(datetime.now()),
-            ),
-        )
-        conn.commit()
-        conn.close()
-
-        st.session_state.adhd_score = score
-        st.session_state.adhd_severity = severity
+    name = st.text_input("Patient", value=st.session_state.get("patient_name", ""))
+    typ = st.radio("Instrument", ["Adult (ASRS)", "Adult (CAARS)", "Child (ADHD-RS)"])
+    if typ == "Adult (ASRS)":
+        qs = ["Trouble wrapping up final details",
+              "Difficulty getting things in order",
+              "Problems remembering appointments",
+              "Must read instructions over and over",
+              "Start new task before finishing previous",
+              "Trouble focusing when needed"]
+        mx = 4
+    elif typ == "Adult (CAARS)":
+        qs = ["Difficulty concentrating", "Easily distracted", "Hard to sit still",
+              "Talk too much", "Interrupt others", "Lose things",
+              "Forget appointments", "Trouble organizing", "Feel restless",
+              "Short attention span"]
+        mx = 4
+    else:
+        qs = ["Fidgets", "Leaves seat", "Runs / climbs", "Difficulty playing quietly",
+              "On the go", "Talks excessively", "Blurts answers", "Awkward waiting",
+              "Interrupts others", "Difficulty organizing"]
+        mx = 3
+    sc = [st.slider(q, 0, mx, 0, key="a" + str(i)) for i, q in enumerate(qs)]
+    tot = sum(sc)
+    thr = {"Adult (ASRS)": 18, "Adult (CAARS)": 30, "Child (ADHD-RS)": 24}[typ]
+    sev = ("None" if tot <= thr // 2 else "Mild" if tot <= thr
+           else "Moderate" if tot <= thr * 1.5 else "Severe")
+    st.success("Score: " + str(tot) + "/" + str(thr) + " | Severity: " + sev)
+    if st.button("Save ADHD"):
+        c = db()
+        c.execute("INSERT INTO adhd_scores (patient_name, total_score, severity, answers, "
+                  "adhd_type, created_by, timestamp) VALUES (?,?,?,?,?,?,?)",
+                  (name or "Unknown", tot, sev, str(sc), typ,
+                   st.session_state.get("user", "?"), str(datetime.now())))
+        c.commit(); c.close()
+        audit("insert", "adhd_scores", detail=name)
+        st.success("Saved.")
 
 
-# ---------------------------------------------------------------------------
-# Counselling & Notes (ENHANCED CANVAS)
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# MORE SCALES / ICD / DRUG / TRENDS / OUTCOMES / AUDIT / BACKUP
+# ===========================================================================
+if page == "More Scales":
+    page_more_scales()
+if page == "ICD Lookup":
+    page_icd()
+if page == "Drug Interactions":
+    page_interactions()
+if page == "Trends":
+    page_trends()
+if page == "Outcomes":
+    page_outcomes()
+if page == "Audit Log":
+    page_audit()
+if page == "Backup & Restore":
+    page_backup()
+if page == "Treatment Tracker":
+    page_treatments()
+
+
+# ===========================================================================
+# COUNSELLING & NOTES (2,11,12,13,15,16,20)
+# ===========================================================================
 if page == "Counselling & Notes":
-    # ---- Full-screen mode: hide Streamlit chrome ----
-    full_screen = st.checkbox("Full-screen drawing mode",
-                              key="draw_fullscreen",
-                              help="Hide the sidebar and expand the canvas.")
+    full_screen = st.checkbox("Full-screen drawing mode", key="draw_fullscreen")
 
     if full_screen:
         st.markdown(
-            """
-            <style>
-              section[data-testid="stSidebar"] {display: none !important;}
-              header[data-testid="stHeader"] {display: none !important;}
-              .block-container {padding: 0.5rem 0.5rem 0.5rem 0.5rem !important;
-                                 max-width: 100% !important;}
-              .stDeployButton {display:none !important;}
-            </style>
-            """,
-            unsafe_allow_html=True,
-        )
+            "<style>"
+            "section[data-testid='stSidebar']{display:none !important;}"
+            "header[data-testid='stHeader']{display:none !important;}"
+            ".block-container{padding:.5rem !important;max-width:100% !important;}"
+            ".stDeployButton{display:none !important;}"
+            "</style>", unsafe_allow_html=True)
 
-    # ---- Header / patient fields ----
     st.title("Counselling & Clinical Notes")
-    st.caption("Decision support only - not a diagnosis. Write, draw or type your notes.")
 
-    col1, col2 = st.columns(2)
-    with col1:
-        st.session_state.note_name = st.text_input(
-            "Patient Name", value=st.session_state.get("patient_name", "")
-        )
-        st.session_state.note_age = st.number_input(
-            "Age", min_value=1, max_value=120, value=30, step=1
-        )
-        st.session_state.note_sex = st.selectbox("Sex", ["Male", "Female", "Other"])
-        st.session_state.note_date = st.date_input("Date", value=date.today())
+    c1, c2 = st.columns(2)
+    with c1:
+        note_name = st.text_input("Patient",
+                                  value=st.session_state.get("patient_name", ""))
+        note_age = st.number_input("Age", 1, 120, 30)
+        note_sex = st.selectbox("Sex", ["Male", "Female", "Other"])
+        note_date = st.date_input("Date", value=date.today())
+    with c2:
+        symptoms = st.text_area("Counselling Symptoms / Issues", height=140)
+        important = st.text_area("Important Notes / Follow-up", height=140)
 
-    with col2:
-        st.session_state.counselling_symptoms = st.text_area(
-            "Counselling Symptoms / Issues", height=150
-        )
-        st.session_state.important_notes = st.text_area(
-            "Important Notes / Follow-up Reminders", height=150
-        )
+    st.subheader("Handwritten Notes")
 
-    # ---- Handwriting toolbar ----
-    st.subheader("Handwritten Notes (Stylus Friendly)")
-
-    PALETTE = {
-        "Black":  "#000000",
-        "Red":    "#E53935",
-        "Blue":   "#1E88E5",
-        "Green":  "#43A047",
-        "Purple": "#8E24AA",
-        "Orange": "#FB8C00",
-        "Brown":  "#6D4C41",
-        "Pink":   "#EC407A",
-    }
-
-    tcol1, tcol2, tcol3, tcol4 = st.columns([2, 1, 1, 1])
-
-    with tcol1:
-        pen_choice = st.selectbox(
-            "Pen colour",
-            list(PALETTE.keys()) + ["Custom..."],
-            key="pen_choice",
-        )
-    with tcol2:
-        if pen_choice == "Custom...":
-            stroke_color = st.color_picker("Custom colour", "#000000",
-                                           key="pen_custom_color")
+    PALETTE = {"Black": "#000000", "Red": "#E53935", "Blue": "#1E88E5",
+               "Green": "#43A047", "Purple": "#8E24AA", "Orange": "#FB8C00",
+               "Brown": "#6D4C41", "Pink": "#EC407A"}
+    t1, t2, t3, t4 = st.columns([2, 1, 1, 1])
+    with t1:
+        pc = st.selectbox("Pen colour", list(PALETTE.keys()) + ["Custom..."], key="pc")
+    with t2:
+        if pc == "Custom...":
+            stroke_color = st.color_picker("Custom", "#000000")
         else:
-            stroke_color = PALETTE[pen_choice]
-            st.color_picker("Selected", stroke_color,
-                            key="pen_shown_color", disabled=True)
-    with tcol3:
-        stroke_width = st.slider("Pen width", 1, 20, 2, key="stroke_width")
-    with tcol4:
-        tool = st.radio("Tool", ["Pen", "Eraser"],
-                        horizontal=False, key="draw_tool")
+            stroke_color = PALETTE[pc]
+            st.color_picker("Selected", stroke_color, disabled=True)
+    with t3:
+        width = st.slider("Pen width", 1, 20, 2)
+    with t4:
+        tool = st.radio("Tool", ["Pen", "Eraser"], key="tool")
 
     if tool == "Eraser":
-        eraser_size = st.slider("Eraser size", 5, 60, 20, key="eraser_size")
+        width = st.slider("Eraser size", 5, 60, 20)
         drawing_mode = "eraser"
-        stroke_width = eraser_size
         stroke_color = "#000000"
     else:
         drawing_mode = "freedraw"
 
-    # Canvas key trick: change key to clear the canvas
-    if "canvas_key_suffix" not in st.session_state:
-        st.session_state.canvas_key_suffix = 0
+    if "cvs" not in st.session_state:
+        st.session_state.cvs = 0
+    if "bg_image" not in st.session_state:
+        st.session_state.bg_image = None
 
-    if full_screen:
-        canvas_h = 900
-        canvas_w = 1600
-    else:
-        canvas_h = 300
-        canvas_w = 800
+    H = 900 if full_screen else 300
+    W = 1600 if full_screen else 800
+
+    bg = None
+    if st.session_state.bg_image:
+        try:
+            b = st.session_state.bg_image
+            if isinstance(b, str) and b.startswith("data:image"):
+                b = b.split(",", 1)[1]
+            raw = base64.b64decode(b) if isinstance(b, str) else b
+            bg = Image.open(io.BytesIO(raw)).convert("RGBA")
+        except Exception:
+            bg = None
 
     canvas_result = st_canvas(
-        fill_color="rgba(255, 165, 0, 0.0)",
-        stroke_width=stroke_width,
+        fill_color="rgba(255,165,0,0)",
+        stroke_width=width,
         stroke_color=stroke_color,
         background_color="#FFFFFF",
-        height=canvas_h,
-        width=canvas_w,
+        background_image=bg,
+        height=H, width=W,
         drawing_mode=drawing_mode,
-        key="handwritten_canvas_" + str(st.session_state.canvas_key_suffix),
+        key="cv_" + str(st.session_state.cvs),
         update_streamlit=True,
     )
 
-    # ---- Toolbar buttons ----
-    b1, b2, b3, b4 = st.columns(4)
-
+    b1, b2, b3, b4, b5 = st.columns(5)
     with b1:
         if st.button("Save handwriting", use_container_width=True):
             arr = canvas_result.image_data
-            has_ink = False
-            if arr is not None and arr.ndim == 3 and arr.shape[2] == 4:
-                has_ink = bool((arr[..., 3] > 0).any())
-            if has_ink:
+            ink = arr is not None and arr.ndim == 3 and arr.shape[2] == 4 \
+                  and bool((arr[..., 3] > 0).any())
+            if ink:
                 st.session_state.handwritten_notes = canvas_to_b64_png(arr)
-                st.success("Handwriting captured. Click 'Save All' to persist.")
+                st.success("Captured.")
             else:
-                st.warning("Draw something first!")
-
+                st.warning("Draw something first.")
     with b2:
-        if st.button("Clear canvas", use_container_width=True):
-            st.session_state.canvas_key_suffix += 1
-            st.session_state.handwritten_notes = None
-            st.rerun()
-
+        if st.button("Undo last", use_container_width=True):
+            h = _clipboard_history()
+            if h:
+                h.pop()
+                if h:
+                    st.session_state.bg_image = h[-1]
+                else:
+                    st.session_state.bg_image = None
+                st.session_state.cvs += 1
+                st.rerun()
+            else:
+                st.session_state.cvs += 1
+                st.session_state.handwritten_notes = None
+                st.rerun()
     with b3:
-        if st.button("Undo last stroke", use_container_width=True,
-                     help="Clears the canvas (fastest reliable undo)."):
-            st.session_state.canvas_key_suffix += 1
+        if st.button("Clear", use_container_width=True):
+            st.session_state.cvs += 1
+            st.session_state.bg_image = None
+            st.session_state.handwritten_notes = None
+            st.session_state.canvas_history = []
             st.rerun()
-
     with b4:
-        # Use on_click so the state change happens before widget creation.
-        st.button(
-            "Exit full-screen" if full_screen else "Enter full-screen",
-            use_container_width=True,
-            on_click=_toggle_fullscreen,
-        )
+        st.button("Fullscreen" if not full_screen else "Exit fullscreen",
+                  use_container_width=True, on_click=_toggle_fullscreen)
+    with b5:
+        if st.button("Push snapshot", use_container_width=True,
+                     help="Adds current view to undo history."):
+            if st.session_state.get("handwritten_notes"):
+                _clipboard_history().append(st.session_state.handwritten_notes)
+                st.success("Snapshot added.")
 
-    # ---- Preview of captured handwriting ----
+    # 12 - SVG download from JSON strokes
+    if canvas_result.json_data and canvas_result.json_data.get("objects"):
+        import json
+        svg = ['<svg xmlns="http://www.w3.org/2000/svg" width="' + str(W)
+               + '" height="' + str(H) + '">',
+               '<rect width="100%" height="100%" fill="#ffffff"/>']
+        for o in canvas_result.json_data["objects"]:
+            if o.get("type") == "path":
+                svg.append('<path d="' + str(o.get("path", [])) + '" fill="none" '
+                           'stroke="' + str(o.get("stroke", "#000")) + '" '
+                           'stroke-width="' + str(o.get("strokeWidth", 2)) + '"/>')
+        svg.append("</svg>")
+        st.download_button("Download handwriting (SVG)",
+                           "".join(svg).encode("utf-8"),
+                           file_name="handwriting.svg", mime="image/svg+xml")
+
+    # 13 - re-edit previous note
+    st.markdown("**Load a previous note to re-edit**")
+    c = db()
+    prev = c.execute("SELECT id, patient_name, date FROM counselling_notes "
+                     "WHERE handwritten_notes <> '' AND deleted_at IS NULL "
+                     "ORDER BY id DESC LIMIT 20").fetchall()
+    c.close()
+    if prev:
+        opts = ["#" + str(r[0]) + " - " + str(r[1]) + " - " + str(r[2]) for r in prev]
+        pick = st.selectbox("Previous notes", ["(none)"] + opts)
+        if pick != "(none)":
+            pid = prev[opts.index(pick)][0]
+            if st.button("Load as background"):
+                c = db()
+                r = c.execute("SELECT handwritten_notes FROM counselling_notes WHERE id=?",
+                              (pid,)).fetchone()
+                c.close()
+                if r and r[0]:
+                    st.session_state.bg_image = dec(r[0])
+                    st.session_state.cvs += 1
+                    st.rerun()
+
+    # 16 - voice dictation via Web Speech API
+    components.html(
+        """
+        <div style="font-family:sans-serif">
+          <button id="rec" style="padding:6px 12px">Start dictation</button>
+          <span id="st" style="margin-left:8px">idle</span>
+          <div id="out" style="margin-top:6px;border:1px solid #ccc;padding:6px;min-height:40px"></div>
+          <script>
+          const btn = document.getElementById('rec');
+          const stx = document.getElementById('st');
+          const out = document.getElementById('out');
+          const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+          if (!SR) { btn.disabled = true; stx.textContent = 'not supported'; }
+          else {
+            const r = new SR();
+            r.continuous = true; r.interimResults = true; r.lang = 'en-US';
+            r.onresult = e => {
+              let t = '';
+              for (let i = e.resultIndex; i < e.results.length; i++) {
+                t += e.results[i][0].transcript + ' ';
+              }
+              out.textContent += t;
+            };
+            let on = false;
+            btn.onclick = () => {
+              if (!on) { r.start(); on = true; btn.textContent = 'Stop';
+                         stx.textContent = 'listening'; }
+              else { r.stop(); on = false; btn.textContent = 'Start dictation';
+                     stx.textContent = 'stopped'; }
+            };
+          }
+          </script>
+        </div>
+        """, height=140)
+    st.caption("Copy the transcript above into the notes box, then save.")
+
     if st.session_state.get("handwritten_notes"):
-        st.caption("Preview of captured handwriting:")
         st.image(st.session_state.handwritten_notes, use_container_width=True)
 
-    # ---- Save all notes ----
-    if st.button("Save All Counselling Notes", type="primary"):
-        hw = st.session_state.get("handwritten_notes", "")
-        if hw is None:
-            hw = ""
-        elif not isinstance(hw, str):
+    if st.button("Save All Notes", type="primary"):
+        hw = st.session_state.get("handwritten_notes", "") or ""
+        if not isinstance(hw, str):
             hw = canvas_to_b64_png(hw)
+        c = db()
+        c.execute("INSERT INTO counselling_notes (patient_name, age, sex, date, "
+                  "counselling_symptoms, important_notes, handwritten_notes, "
+                  "created_by, timestamp) VALUES (?,?,?,?,?,?,?,?,?)",
+                  (note_name or "Unknown", str(note_age), note_sex, str(note_date),
+                   symptoms, important, enc(hw),
+                   st.session_state.get("user", "?"), str(datetime.now())))
+        c.commit(); c.close()
+        audit("insert", "counselling_notes", detail=note_name)
+        st.success("Saved.")
 
-        conn = get_conn()
-        conn.execute(
-            "INSERT INTO counselling_notes ("
-            "patient_name, age, sex, date, counselling_symptoms, important_notes, "
-            "handwritten_notes, timestamp"
-            ") VALUES (?,?,?,?,?,?,?,?)",
-            (
-                st.session_state.note_name or st.session_state.get("patient_name", "Unknown"),
-                str(st.session_state.note_age),
-                st.session_state.note_sex,
-                str(st.session_state.note_date),
-                st.session_state.counselling_symptoms,
-                st.session_state.important_notes,
-                hw,
-                str(datetime.now()),
-            ),
-        )
-        conn.commit()
-        conn.close()
-        st.success("All notes saved!")
-
-    # ---- Saved notes ----
-    st.subheader("Saved Counselling Notes")
-    conn = get_conn()
-    notes = conn.execute(
-        "SELECT id, patient_name, date, counselling_symptoms, important_notes, "
-        "handwritten_notes, timestamp FROM counselling_notes "
-        "ORDER BY timestamp DESC"
-    ).fetchall()
-    conn.close()
-
-    if notes:
-        for n in notes[:10]:
-            header = str(n[1]) + " - " + str(n[2])
-            with st.expander(header):
-                st.markdown("**Counselling Symptoms / Issues:**")
-                st.write(n[3] or "-")
-                st.markdown("**Important Notes / Follow-up Reminders:**")
-                st.write(n[4] or "-")
-                if n[5]:
-                    st.markdown("**Handwritten notes:**")
-                    st.image(n[5], use_container_width=True)
-                st.caption("Saved: " + str(n[6]))
-    else:
-        st.info("No notes saved yet.")
+    st.subheader("Saved notes")
+    c = db()
+    rows = c.execute("SELECT id, patient_name, date, counselling_symptoms, "
+                     "important_notes, handwritten_notes, timestamp "
+                     "FROM counselling_notes WHERE deleted_at IS NULL "
+                     "ORDER BY id DESC LIMIT 20").fetchall()
+    c.close()
+    for r in rows:
+        with st.expander("#" + str(r[0]) + " - " + str(r[1]) + " - " + str(r[2])):
+            st.write(r[3] or "-")
+            st.write(r[4] or "-")
+            if r[5]:
+                st.image(dec(r[5]), use_container_width=True)
+            st.caption("Saved: " + str(r[6]))
 
 
-# ---------------------------------------------------------------------------
-# Report
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# REPORT (3)
+# ===========================================================================
 if page == "Report":
     st.title("Clinical Report")
     rep = st.session_state.get("current_report")
     ai = st.session_state.get("current_ai")
-
     if rep:
         st.code(rep, language="text")
         if ai:
             st.markdown(ai)
-        st.download_button(
-            "Download Report (txt)",
-            rep,
-            file_name="report_" + str(date.today()) + ".txt",
-            mime="text/plain",
-        )
+        d1, d2 = st.columns(2)
+        with d1:
+            st.download_button("Download .txt", rep,
+                               file_name="report.txt", mime="text/plain")
+        with d2:
+            pdf = report_to_pdf(rep) if HAS_FPDF else None
+            if pdf:
+                st.download_button("Download PDF", pdf,
+                                   file_name="report.pdf", mime="application/pdf")
+            else:
+                st.caption("Install fpdf2 for PDF export.")
     else:
-        st.info("No report yet. Run an Assessment first.")
+        st.info("No current report. Run an Assessment.")
 
     st.divider()
-    st.subheader("Past Reports")
-    conn = get_conn()
-    rows = conn.execute(
-        "SELECT id, patient_name, syndrome, severity, risk_level, timestamp "
-        "FROM assessments ORDER BY id DESC LIMIT 25"
-    ).fetchall()
-    conn.close()
-
-    if rows:
-        for r in rows:
-            with st.expander("#" + str(r[0]) + " - " + str(r[1]) + " - "
-                             + str(r[2]) + " (" + str(r[4]) + ") - "
-                             + str(r[5])[:16]):
-                conn = get_conn()
-                full = conn.execute(
-                    "SELECT report_text, ai_insights FROM assessments WHERE id=?",
-                    (r[0],),
-                ).fetchone()
-                conn.close()
-                if full:
-                    st.code(full[0] or "", language="text")
-                    if full[1]:
-                        st.markdown(full[1])
-    else:
-        st.info("No past assessments found.")
+    st.subheader("Past reports")
+    c = db()
+    rows = c.execute("SELECT id, patient_name, syndrome, severity, risk_level, timestamp "
+                     "FROM assessments WHERE deleted_at IS NULL "
+                     "ORDER BY id DESC LIMIT 25").fetchall()
+    c.close()
+    for r in rows:
+        with st.expander("#" + str(r[0]) + " - " + str(r[1]) + " - " + str(r[2])):
+            c = db()
+            f = c.execute("SELECT report_text, ai_insights FROM assessments WHERE id=?",
+                          (r[0],)).fetchone()
+            c.close()
+            if f:
+                st.code(f[0] or "", language="text")
+                if f[1]:
+                    st.markdown(f[1])
 
 
-# ---------------------------------------------------------------------------
-# Chat
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# CHAT
+# ===========================================================================
 if page == "Chat":
     st.title("Clinical Chat Assistant")
-    st.caption("Decision support only - not a substitute for clinical judgement.")
-
     if "chat_history" not in st.session_state:
         st.session_state.chat_history = []
-
     for role, msg in st.session_state.chat_history:
         with st.chat_message(role):
             st.write(msg)
-
     q = st.chat_input("Ask about depression, mania, risk, PHQ-9...")
     if q:
         st.session_state.chat_history.append(("user", q))
         with st.chat_message("user"):
             st.write(q)
-        a = chatbot_reply(q)
+        a = random.choice([
+            "This is decision support only. Verify with guidelines.",
+            "Document clinical reasoning.",
+            "Regular follow-up is essential.",
+        ])
         st.session_state.chat_history.append(("assistant", a))
         with st.chat_message("assistant"):
             st.write(a)
 
 
-# ---------------------------------------------------------------------------
-# History
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# HISTORY (21,22)
+# ===========================================================================
 if page == "History":
     st.title("Assessment History")
-    conn = get_conn()
-    df = pd.read_sql_query(
-        "SELECT id, patient_name, age, sex, syndrome, severity, risk_level, "
-        "organic_level, symptom_weight, timestamp FROM assessments ORDER BY id DESC",
-        conn,
-    )
-    conn.close()
-
-    if df.empty:
-        st.info("No assessments recorded yet.")
+    q = st.text_input("Search (name or syndrome)")
+    pg = st.number_input("Page", 1, 999, 1) - 1
+    per = 25
+    c = db()
+    where = "WHERE deleted_at IS NULL"
+    params = []
+    if q:
+        where += " AND (patient_name LIKE ? OR syndrome LIKE ?)"
+        params += ["%" + q + "%", "%" + q + "%"]
+    if USE_PG:
+        sql = ("SELECT id, patient_name, age, sex, syndrome, severity, risk_level, "
+               "timestamp FROM assessments " + where +
+               " ORDER BY id DESC LIMIT " + str(per) + " OFFSET " + str(pg * per))
     else:
+        sql = ("SELECT id, patient_name, age, sex, syndrome, severity, risk_level, "
+               "timestamp FROM assessments " + where +
+               " ORDER BY id DESC LIMIT ? OFFSET ?")
+        params += [per, pg * per]
+    rows = c.execute(sql, tuple(params)).fetchall()
+    c.close()
+    if not rows:
+        st.info("No results.")
+    else:
+        df = pd.DataFrame(rows, columns=["id", "patient", "age", "sex",
+                                          "syndrome", "severity", "risk", "ts"])
         st.dataframe(df, use_container_width=True)
-        sel = st.selectbox("Open assessment by ID", df["id"].tolist())
-        if sel:
-            conn = get_conn()
-            row = conn.execute(
-                "SELECT report_text, ai_insights FROM assessments WHERE id=?",
-                (int(sel),),
-            ).fetchone()
-            conn.close()
-            if row:
-                st.code(row[0] or "", language="text")
-                if row[1]:
-                    st.markdown(row[1])
 
 
-# ---------------------------------------------------------------------------
-# Patient Database
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# PATIENT DATABASE (21,22)
+# ===========================================================================
 if page == "Patient Database":
     st.title("Patient Database")
-    conn = get_conn()
-    df = pd.read_sql_query(
-        "SELECT id, name, age, sex, phone, first_seen, last_seen "
-        "FROM patients ORDER BY last_seen DESC",
-        conn,
-    )
-    conn.close()
-
-    if df.empty:
-        st.info("No patients yet. Save an assessment to create a patient record.")
+    q = st.text_input("Search name")
+    c = db()
+    if q:
+        rows = c.execute("SELECT id, name, age, sex, first_seen, last_seen "
+                         "FROM patients WHERE deleted_at IS NULL AND name LIKE ? "
+                         "ORDER BY last_seen DESC", ("%" + q + "%",)).fetchall()
     else:
+        rows = c.execute("SELECT id, name, age, sex, first_seen, last_seen "
+                         "FROM patients WHERE deleted_at IS NULL "
+                         "ORDER BY last_seen DESC LIMIT 200").fetchall()
+    c.close()
+    if not rows:
+        st.info("No patients.")
+    else:
+        df = pd.DataFrame(rows, columns=["id", "name", "age", "sex",
+                                          "first_seen", "last_seen"])
         st.dataframe(df, use_container_width=True)
-        pat = st.selectbox("Select patient", df["name"].tolist())
-        if pat:
-            c1, c2, c3 = st.columns(3)
-            conn = get_conn()
-            with c1:
-                st.subheader("Assessments")
-                a = pd.read_sql_query(
-                    "SELECT id, syndrome, severity, risk_level, timestamp "
-                    "FROM assessments WHERE patient_name=? ORDER BY id DESC",
-                    conn, params=(pat,),
-                )
-                st.dataframe(a, use_container_width=True)
-            with c2:
-                st.subheader("Counselling Notes")
-                n = pd.read_sql_query(
-                    "SELECT id, date, counselling_symptoms "
-                    "FROM counselling_notes WHERE patient_name=? ORDER BY id DESC",
-                    conn, params=(pat,),
-                )
-                st.dataframe(n, use_container_width=True)
-            with c3:
-                st.subheader("Follow-ups")
-                f = pd.read_sql_query(
-                    "SELECT id, follow_up_date, status "
-                    "FROM follow_ups WHERE patient_name=? ORDER BY id DESC",
-                    conn, params=(pat,),
-                )
-                st.dataframe(f, use_container_width=True)
-            conn.close()
+        pick = st.selectbox("Select patient to view", df["name"].tolist())
+        if pick:
+            c = db()
+            a = pd.read_sql_query(
+                "SELECT id, syndrome, severity, risk_level, timestamp FROM assessments "
+                "WHERE patient_name=? AND deleted_at IS NULL ORDER BY id DESC",
+                c._raw, params=(pick,))
+            t = pd.read_sql_query(
+                "SELECT id, medication_name, dose, status, start_date FROM treatments "
+                "WHERE patient_name=? AND deleted_at IS NULL ORDER BY id DESC",
+                c._raw, params=(pick,))
+            c.close()
+            st.subheader("Assessments")
+            st.dataframe(a, use_container_width=True)
+            st.subheader("Treatments")
+            st.dataframe(t, use_container_width=True)
 
 
-# ---------------------------------------------------------------------------
-# Follow-up
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# FOLLOW-UP
+# ===========================================================================
 if page == "Follow-up":
     st.title("Follow-up")
-
-    col1, col2 = st.columns(2)
-    with col1:
-        st.subheader("Schedule Follow-up")
-        fu_name = st.text_input(
-            "Patient Name", value=st.session_state.get("patient_name", ""),
-            key="fu_name",
-        )
-        fu_date = st.date_input("Follow-up date", value=date.today(), key="fu_date")
-        fu_notes = st.text_area("Notes", height=100, key="fu_notes")
+    c1, c2 = st.columns(2)
+    with c1:
+        name = st.text_input("Patient", value=st.session_state.get("patient_name", ""))
+        d = st.date_input("Date", value=date.today() + timedelta(days=14))
+        notes = st.text_area("Notes", height=100)
         if st.button("Schedule"):
-            if fu_name.strip():
-                conn = get_conn()
-                conn.execute(
-                    "INSERT INTO follow_ups (patient_name, follow_up_date, status, notes, created_at) "
-                    "VALUES (?,?,?,?,?)",
-                    (fu_name.strip(), str(fu_date), "Scheduled", fu_notes,
-                     str(datetime.now())),
-                )
-                conn.commit()
-                conn.close()
-                st.success("Follow-up scheduled.")
+            if name.strip():
+                c = db()
+                c.execute("INSERT INTO follow_ups (patient_name, follow_up_date, "
+                          "status, notes, created_by, created_at) VALUES (?,?,?,?,?,?)",
+                          (name.strip(), str(d), "Scheduled", notes,
+                           st.session_state.get("user", "?"), str(datetime.now())))
+                c.commit(); c.close()
+                audit("insert", "follow_ups", detail=name)
+                st.success("Scheduled.")
                 st.rerun()
-            else:
-                st.warning("Enter patient name.")
-
-    with col2:
-        st.subheader("Complete Follow-up")
-        conn = get_conn()
-        pending = conn.execute(
-            "SELECT id, patient_name, follow_up_date FROM follow_ups "
-            "WHERE status='Scheduled' ORDER BY follow_up_date"
-        ).fetchall()
-        conn.close()
-
+    with c2:
+        c = db()
+        pending = c.execute("SELECT id, patient_name, follow_up_date FROM follow_ups "
+                            "WHERE status='Scheduled' AND deleted_at IS NULL "
+                            "ORDER BY follow_up_date").fetchall()
+        c.close()
         if pending:
-            labels = ["#" + str(r[0]) + " - " + str(r[1]) + " - " + str(r[2])
-                      for r in pending]
-            opt = st.selectbox("Pending follow-ups", labels)
-            fu_id = pending[labels.index(opt)][0]
-
-            improved = st.radio("Symptoms improved?", ["Yes", "Partially", "No"],
-                                horizontal=True, key="fu_improved")
-            adherence = st.selectbox("Adherence", ["Good", "Partial", "Poor"],
-                                     key="fu_adh")
-            se = st.text_input("Side effects", key="fu_se")
+            opts = ["#" + str(r[0]) + " - " + str(r[1]) + " - " + str(r[2]) for r in pending]
+            pick = st.selectbox("Pending", opts)
+            fid = pending[opts.index(pick)][0]
+            imp = st.radio("Improved?", ["Yes", "Partially", "No"], horizontal=True)
+            adh = st.selectbox("Adherence", ["Good", "Partial", "Poor"])
+            se = st.text_input("Side effects")
             gi = st.selectbox("Global impression",
-                              ["Much improved", "Improved", "No change", "Worse"],
-                              key="fu_gi")
-
+                              ["Much improved", "Improved", "No change", "Worse"])
             if st.button("Mark complete"):
-                conn = get_conn()
-                conn.execute(
-                    "UPDATE follow_ups SET status='Completed', symptoms_improved=?, "
-                    "adherence=?, side_effects=?, global_impression=?, completed_at=? "
-                    "WHERE id=?",
-                    (improved, adherence, se, gi, str(datetime.now()), fu_id),
-                )
-                conn.commit()
-                conn.close()
-                st.success("Follow-up recorded.")
+                c = db()
+                c.execute("UPDATE follow_ups SET status='Completed', symptoms_improved=?, "
+                          "adherence=?, side_effects=?, global_impression=?, completed_at=? "
+                          "WHERE id=?", (imp, adh, se, gi, str(datetime.now()), fid))
+                c.commit(); c.close()
+                audit("update", "follow_ups", fid)
+                st.success("Saved.")
                 st.rerun()
         else:
-            st.info("No scheduled follow-ups.")
+            st.info("No pending follow-ups.")
 
-    st.divider()
-    st.subheader("All Follow-ups")
-    conn = get_conn()
-    df = pd.read_sql_query("SELECT * FROM follow_ups ORDER BY id DESC", conn)
-    conn.close()
+    st.subheader("All")
+    c = db()
+    df = pd.read_sql_query("SELECT * FROM follow_ups WHERE deleted_at IS NULL "
+                           "ORDER BY id DESC", c._raw)
+    c.close()
     st.dataframe(df, use_container_width=True)
 
 
-# ---------------------------------------------------------------------------
-# Epidemiology
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# EPIDEMIOLOGY (28)
+# ===========================================================================
 if page == "Epidemiology":
-    st.title("Epidemiology (local DB)")
-    conn = get_conn()
+    st.title("Epidemiology")
+    days = st.slider("Look-back window (days)", 7, 3650, 365)
+    since = str(date.today() - timedelta(days=days))
+    c = db()
     df = pd.read_sql_query(
-        "SELECT syndrome, severity, risk_level, age, sex FROM assessments", conn
-    )
-    conn.close()
-
+        "SELECT syndrome, severity, risk_level, age, sex FROM assessments "
+        "WHERE deleted_at IS NULL AND timestamp >= ?",
+        c._raw, params=(since,))
+    c.close()
     if df.empty:
-        st.info("No data yet.")
+        st.info("No data in that window.")
     else:
         c1, c2 = st.columns(2)
         with c1:
-            st.subheader("By syndrome")
-            st.bar_chart(df["syndrome"].value_counts())
-            st.subheader("By severity")
-            st.bar_chart(df["severity"].value_counts())
+            st.subheader("By syndrome"); st.bar_chart(df["syndrome"].value_counts())
+            st.subheader("By severity"); st.bar_chart(df["severity"].value_counts())
         with c2:
-            st.subheader("By risk level")
-            st.bar_chart(df["risk_level"].value_counts())
-            st.subheader("By sex")
-            st.bar_chart(df["sex"].value_counts())
+            st.subheader("By risk"); st.bar_chart(df["risk_level"].value_counts())
+            st.subheader("By sex"); st.bar_chart(df["sex"].value_counts())
 
 
-# ---------------------------------------------------------------------------
-# Export Data
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# EXPORT DATA (30)
+# ===========================================================================
 if page == "Export Data":
     st.title("Export Data")
     tables = ["assessments", "treatments", "phq9_scores", "gad7_scores",
-              "adhd_scores", "counselling_notes", "follow_ups", "patients"]
-    conn = get_conn()
+              "adhd_scores", "other_scales", "counselling_notes",
+              "follow_ups", "patients", "audit_log"]
+    xl = export_excel(tables)
+    if xl:
+        st.download_button("Download all tables (.xlsx)", xl,
+                           file_name="psychassist_export_" + str(date.today()) + ".xlsx",
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    else:
+        st.warning("Install openpyxl to enable multi-sheet Excel export.")
+
     for t in tables:
+        c = db()
         try:
-            df = pd.read_sql_query("SELECT * FROM " + t, conn)
+            df = pd.read_sql_query("SELECT * FROM " + t, c._raw)
         except Exception:
-            continue
-        st.subheader(t)
-        st.write(str(len(df)) + " rows")
-        st.download_button(
-            "Download " + t + ".csv",
-            df.to_csv(index=False).encode("utf-8"),
-            file_name=t + "_" + str(date.today()) + ".csv",
-            mime="text/csv",
-            key="dl_" + t,
-        )
-    conn.close()
+            c.close(); continue
+        c.close()
+        st.subheader(t + " (" + str(len(df)) + " rows)")
+        st.download_button("Download " + t + ".csv",
+                           df.to_csv(index=False).encode("utf-8"),
+                           file_name=t + "_" + str(date.today()) + ".csv",
+                           mime="text/csv", key="dl_" + t)
 
 
-# ---------------------------------------------------------------------------
+# ------------------------------- print CSS (31) ----------------------------
+st.markdown(
+    "<style>"
+    "@media print {"
+    ".stSidebar, header, .stDeployButton, .stButton, .stDownloadButton "
+    "{display:none !important;}"
+    "}"
+    "</style>", unsafe_allow_html=True)
+
 # End of file
-# ---------------------------------------------------------------------------
