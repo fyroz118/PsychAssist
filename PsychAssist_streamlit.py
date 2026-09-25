@@ -20,6 +20,7 @@ import os
 import base64
 import hashlib
 import random
+import re
 import sqlite3
 import time
 from datetime import datetime, date, timedelta
@@ -29,7 +30,6 @@ import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
 from PIL import Image
-from streamlit_drawable_canvas import st_canvas
 
 # --------------------------- optional imports ------------------------------
 try:
@@ -209,6 +209,96 @@ class DBConn:
 
 def db():
     return DBConn(get_conn(), USE_PG)
+
+
+def _all_patient_rows():
+    c = db()
+    rows = c.execute(
+        "SELECT name, age, sex FROM patients ORDER BY id"
+    ).fetchall()
+    c.close()
+    return rows
+
+
+def _patient_base_matches(label, base_name):
+    return label == base_name or label.startswith(base_name + " (")
+
+
+def _next_patient_code(rows):
+    used = set()
+    for row in rows:
+        match = re.search(r"\bP([0-9]{4})\b", str(row[0]))
+        if match:
+            used.add("P" + match.group(1))
+    number = 1
+    while "P" + str(number).zfill(4) in used:
+        number += 1
+    return "P" + str(number).zfill(4)
+
+
+def suggest_patient_label(base_name, age, sex):
+    base_name = str(base_name or "").strip()
+    if not base_name:
+        return ""
+    rows = _all_patient_rows()
+    if not any(_patient_base_matches(str(row[0]), base_name) for row in rows):
+        return base_name
+    code = _next_patient_code(rows)
+    return base_name + " (" + str(age) + str(sex)[0].upper() + " - " + code + ")"
+
+
+def _insert_patient_record(label, age, sex):
+    now = str(datetime.now())
+    c = db()
+    c.execute(
+        "INSERT INTO patients (name, age, sex, first_seen, last_seen, "
+        "created_at, created_by) VALUES (?,?,?,?,?,?,?)",
+        (label, str(age), sex, now, now, now,
+         st.session_state.get("user", "?"))
+    )
+    c.commit()
+    row = c.execute("SELECT id FROM patients WHERE name=?", (label,)).fetchone()
+    c.close()
+    return row[0] if row else None
+
+
+def upsert_patient(name, age, sex):
+    # Reuse an exact patient match or create a unique composite label.
+    base_name = str(name or "").strip()
+    if not base_name:
+        return ""
+    age_text = str(age)
+    c = db()
+    row = c.execute(
+        "SELECT name FROM patients WHERE name=? AND age=? AND sex=?",
+        (base_name, age_text, sex)
+    ).fetchone()
+    if row:
+        c.execute(
+            "UPDATE patients SET last_seen=? WHERE name=?",
+            (str(datetime.now()), row[0])
+        )
+        c.commit()
+        c.close()
+        return row[0]
+    c.close()
+
+    label = suggest_patient_label(base_name, age, sex)
+    _insert_patient_record(label, age_text, sex)
+    return label
+
+
+def _refresh_register_label():
+    st.session_state.register_label = suggest_patient_label(
+        st.session_state.get("register_base_name", ""),
+        st.session_state.get("register_age", 30),
+        st.session_state.get("register_sex", "Male")
+    )
+    st.session_state.register_label_manual = False
+
+
+def _mark_register_label_manual():
+    st.session_state.register_label_manual = True
 
 
 def init_db():
@@ -432,6 +522,21 @@ DRUG_INTERACTIONS = [
     ("Antipsychotic", "Metformin", "Minor", "Weight gain mitigation."),
     ("Lamotrigine", "OCP", "Moderate", "OCP reduces lamotrigine levels."),
 ]
+
+
+def find_interactions(medications):
+    """Return curated interactions matching medication names or classes."""
+    tokens = {
+        str(value).strip().casefold()
+        for medication in medications
+        for value in medication[:2]
+        if value
+    }
+    return [
+        row for row in DRUG_INTERACTIONS
+        if row[0].casefold() in tokens and row[1].casefold() in tokens
+    ]
+
 
 medication_database = {
     "Major Depressive Disorder": {
@@ -677,7 +782,7 @@ def has_s(sel, s): return s in sel
 def severity_grader(score):
     if score <= 5: return "Mild"
     if score <= 12: return "Moderate"
-    if score <= 20: return "Severe"
+    if score <= 30: return "Severe"
     return "Very Severe"
 
 def depressive_logic(sel, dur, aff):
@@ -705,7 +810,7 @@ def mania_logic(sel, dur, sp, th):
 
 def psychosis_logic(sel, dur, sp, th):
     if not (has_s(sel,"Auditory hallucinations")
-            or has_s(sel,"Visual hallucinations") or has_s(sel,"Delusions")):
+            or has_s(sel,"Delusions")):
         return 0
     s = 12
     for x in ["Paranoia","Disorganized speech","Negative symptoms"]:
@@ -769,7 +874,7 @@ def organic_psychosis_detector(sel, onset, fluc, sz, focal, hi):
     if focal: sc += 5
     if onset == "Sudden": sc += 3
     if hi: sc += 4
-    if sc >= 15: lvl = "VERY HIGH suspicion of organic psychosis"
+    if sc >= 14: lvl = "VERY HIGH suspicion of organic psychosis"
     elif sc >= 10: lvl = "HIGH suspicion of organic psychosis"
     elif sc >= 6: lvl = "MODERATE suspicion of organic psychosis"
     else: lvl = "LOW suspicion of organic psychosis"
@@ -783,8 +888,8 @@ def risk_assessment(sel, plan, cmd, vio, means):
     if vio: sc += 5
     if means: sc += 4
     if sc >= 15: return "CRITICAL RISK", "IMMEDIATE HOSPITALIZATION REQUIRED", sc
-    if sc >= 10: return "HIGH RISK", "URGENT psychiatric consultation required", sc
-    if sc >= 5: return "MODERATE RISK", "Enhanced monitoring required", sc
+    if sc >= 6: return "HIGH RISK", "URGENT psychiatric consultation required", sc
+    if sc >= 3: return "MODERATE RISK", "Enhanced monitoring required", sc
     return "LOW RISK", "Routine monitoring", sc
 
 def mixed_features_detector(sel):
@@ -940,6 +1045,7 @@ def sidebar_context():
         sel = st.selectbox("Current patient", options,
                            index=options.index(default), key="global_patient")
         st.session_state.patient_name = "" if sel == "(none)" else sel
+        st.caption("Duplicates appear as: Name (45M - P0002)")
 
         # 9 - badges
         c = db()
@@ -973,6 +1079,79 @@ def sidebar_context():
                 ".stApp {background-color:#0e1117;color:#fafafa;}"
                 ".block-container {color:#fafafa;}"
                 "</style>", unsafe_allow_html=True)
+
+
+# --------------------------- patient registration --------------------------
+def page_register_patient():
+    st.title("Register Patient")
+    st.caption("Use a unique label when patients share the same name.")
+
+    if "register_base_name" not in st.session_state:
+        st.session_state.register_base_name = ""
+    if "register_age" not in st.session_state:
+        st.session_state.register_age = 30
+    if "register_sex" not in st.session_state:
+        st.session_state.register_sex = "Male"
+    if "register_label" not in st.session_state:
+        st.session_state.register_label = suggest_patient_label(
+            st.session_state.register_base_name,
+            st.session_state.register_age,
+            st.session_state.register_sex
+        )
+
+    base_name = st.text_input(
+        "Full name",
+        key="register_base_name",
+        on_change=_refresh_register_label
+    )
+    age = st.number_input(
+        "Age", min_value=1, max_value=120, key="register_age",
+        on_change=_refresh_register_label
+    )
+    sex = st.selectbox(
+        "Sex", ["Male", "Female", "Other"], key="register_sex",
+        on_change=_refresh_register_label
+    )
+    suggested = suggest_patient_label(base_name, age, sex)
+    st.caption("Suggested label: " + (suggested or "(enter a full name)"))
+    final_label = st.text_input(
+        "Patient label",
+        key="register_label",
+        on_change=_mark_register_label_manual
+    )
+
+    if st.button("Register patient", type="primary"):
+        label = final_label.strip()
+        if not base_name.strip():
+            st.warning("Enter a full name.")
+        elif not label:
+            st.warning("Enter a patient label.")
+        else:
+            c = db()
+            duplicate = c.execute(
+                "SELECT id FROM patients WHERE name=?", (label,)
+            ).fetchone()
+            c.close()
+            if duplicate:
+                st.warning("That patient label already exists. No patient was added.")
+            else:
+                row_id = _insert_patient_record(label, age, sex)
+                st.session_state.patient_name = label
+                audit("insert", "patients", row_id, "Registered patient")
+                st.success("Patient registered: " + label)
+
+    st.subheader("Registered patients")
+    c = db()
+    df = pd.read_sql_query(
+        "SELECT name, age, sex, first_seen FROM patients "
+        "WHERE deleted_at IS NULL ORDER BY id DESC",
+        c._raw
+    )
+    c.close()
+    if df.empty:
+        st.info("No patients registered yet.")
+    else:
+        st.dataframe(df, use_container_width=True)
 
 
 # --------------------------- treatment tracker (1) -------------------------
@@ -1146,9 +1325,7 @@ def page_interactions():
         if not meds:
             st.info("No active medications for this patient.")
         else:
-            classes = set(m[1] for m in meds)
-            hits = [row for row in DRUG_INTERACTIONS
-                    if row[0] in classes and row[1] in classes]
+            hits = find_interactions(meds)
             if hits:
                 for h in hits:
                     st.error(h[0] + " + " + h[1] + " (" + h[2] + "): " + h[3])
@@ -1288,7 +1465,7 @@ sidebar_context()
 # NAVIGATION
 # ===========================================================================
 pages = [
-    "Assessment", "PHQ-9", "GAD-7", "ADHD", "More Scales",
+    "Register Patient", "Assessment", "PHQ-9", "GAD-7", "ADHD", "More Scales",
     "Counselling & Notes", "Treatment Tracker", "Report", "Trends",
     "ICD Lookup", "Drug Interactions", "Chat",
     "History", "Patient Database", "Follow-up",
@@ -1296,6 +1473,13 @@ pages = [
     "Backup & Restore", "Export Data",
 ]
 page = st.sidebar.radio("Navigation", pages)
+
+
+# ===========================================================================
+# PATIENT REGISTRATION
+# ===========================================================================
+if page == "Register Patient":
+    page_register_patient()
 
 
 # ===========================================================================
@@ -1345,20 +1529,8 @@ if page == "Assessment":
             if not name.strip():
                 st.error("Enter patient name")
             else:
-                # upsert patient
-                c = db()
-                now = str(datetime.now())
-                row = c.execute("SELECT id FROM patients WHERE name=?", (name.strip(),)).fetchone()
-                if row:
-                    c.execute("UPDATE patients SET age=?, sex=?, last_seen=? WHERE name=?",
-                              (str(age), sex, now, name.strip()))
-                else:
-                    c.execute("INSERT INTO patients (name, age, sex, first_seen, last_seen, "
-                              "created_at, created_by) VALUES (?,?,?,?,?,?,?)",
-                              (name.strip(), str(age), sex, now, now, now,
-                               st.session_state.get("user", "?")))
-                c.commit()
-                c.close()
+                name = upsert_patient(name, age, sex)
+                st.session_state.patient_name = name
 
                 onset_s = "Sudden" if onset == "Sudden" else "Gradual"
                 fluc = "Fluctuating cognition" in neuro
@@ -1496,8 +1668,14 @@ if page == "ADHD":
     tot = sum(sc)
     thr = {"Adult (ASRS)": 18, "Adult (CAARS)": 30, "Child (ADHD-RS)": 24}[typ]
     sev = ("None" if tot <= thr // 2 else "Mild" if tot <= thr
-           else "Moderate" if tot <= thr * 1.5 else "Severe")
+           else "Severe" if tot * 3 >= thr * 4 else "Moderate")
     st.success("Score: " + str(tot) + "/" + str(thr) + " | Severity: " + sev)
+    if tot >= thr:
+        st.info(
+            "Positive screen: stimulant and non-stimulant treatment options "
+            "may be considered after a qualified clinician completes a full "
+            "assessment. This is not a prescription."
+        )
     if st.button("Save ADHD"):
         c = db()
         c.execute("INSERT INTO adhd_scores (patient_name, total_score, severity, answers, "
@@ -1534,6 +1712,8 @@ if page == "Treatment Tracker":
 # COUNSELLING & NOTES (2,11,12,13,15,16,20)
 # ===========================================================================
 if page == "Counselling & Notes":
+    from streamlit_drawable_canvas import st_canvas
+
     full_screen = st.checkbox("Full-screen drawing mode", key="draw_fullscreen")
 
     if full_screen:
@@ -1613,6 +1793,7 @@ if page == "Counselling & Notes":
         drawing_mode=drawing_mode,
         key="cv_" + str(st.session_state.cvs),
         update_streamlit=True,
+        return_image_data=True,
     )
 
     b1, b2, b3, b4, b5 = st.columns(5)
